@@ -1066,12 +1066,13 @@ void processCommand(const char *cmd) {
             openListenPipes();
 
             if (!sent) {
-                state = S_IDLE;
-                dialRetryCount = 0;
-                dialRetrying   = false;
-                sendNoCarrier();
+                // radio.write() failed (HWACK: all HW retries exhausted; no receiver
+                // present). Don't bail immediately — leave state as S_CONNECTING and
+                // let the S7 timeout in loop() handle it. That way S8 retries and
+                // S9 intervals work correctly even when the remote is absent.
+                // connectStart will be set to now on the next loop() iteration.
             }
-            // Carrier wait timeout driven by S7, handled in loop().
+            // Carrier wait timeout (S7) and retries (S8/S9) handled in loop().
         } else {
             sendError();
         }
