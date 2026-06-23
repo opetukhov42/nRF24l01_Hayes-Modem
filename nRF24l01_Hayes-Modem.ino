@@ -239,7 +239,8 @@ unsigned long ledErOff  = 0;   // millis() time to extinguish ER
 unsigned long lastSerialMs = 0;
 
 // Sequence numbers
-uint8_t txSeq = 0;
+uint8_t txSeq     = 0;    // sequence counter for ALL outbound packets
+uint8_t dataTxSeq = 0;    // sequence counter for PKT_DATA only (SWFLOW window)
 uint8_t rxExpected = 0;
 
 // ACK mode
@@ -533,11 +534,15 @@ bool sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
         memcpy(pkt + DATA_OFFSET, data, pkt[2]);
 
     // In SWFLOW mode, store DATA packets in the retransmit window.
+    // dataTxSeq is a data-only counter so window seq numbers are not
+    // polluted by interleaved control packets (PING, PONG, SWACK etc.).
     if (!hwAck && type == PKT_DATA) {
-        SwSlot &slot = swWin[swWinHead % SW_WIN_SIZE];
-        memcpy(slot.pkt, pkt, PAYLOAD_SIZE);
-        slot.sentMs = millis();
-        slot.used   = true;
+        pkt[1] = dataTxSeq;          // overwrite with data-only seq
+        uint8_t slotIdx = swWinHead % SW_WIN_SIZE;
+        memcpy(swWin[slotIdx].pkt, pkt, PAYLOAD_SIZE);
+        swWin[slotIdx].sentMs = millis();
+        swWin[slotIdx].used   = true;
+        dataTxSeq++;
         swWinHead++;
     }
 
@@ -659,6 +664,9 @@ void handleRadioPacket(const uint8_t *pkt) {
             if (state == S_DATA || state == S_CONNECTED) {
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                 swAckValid    = false;
+                swWinHead     = 0;
+                dataTxSeq     = 0;
+                swAckedSeq    = 0;
                 kaInitiator   = false;
                 kaMissed      = 0;
                 kaWaitingPong = false;
@@ -850,6 +858,10 @@ void factoryReset() {
     kaPingAt       = 0;
     kaLastPingMs   = 0;
     yieldToRemote  = false;
+    dataTxSeq      = 0;
+    swWinHead      = 0;
+    swAckedSeq     = 0;
+    swAckValid     = false;
 
     // Persist — saveConfig() writes magic byte last
     saveConfig();
@@ -1005,6 +1017,9 @@ void processCommand(const char *cmd) {
         // Clear SWFLOW window and cancel any pending retry on hangup.
         for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
         swAckValid     = false;
+        swWinHead      = 0;
+        dataTxSeq      = 0;
+        swAckedSeq     = 0;
         dialRetrying   = false;
         dialRetryCount = 0;
         kaInitiator    = false;
@@ -1574,6 +1589,9 @@ void loop() {
                 if (kaMissed >= regS12) {
                     for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                     swAckValid    = false;
+                    swWinHead     = 0;
+                    dataTxSeq     = 0;
+                    swAckedSeq    = 0;
                     kaMissed      = 0;
                     kaWaitingPong = false;
                     kaPingAt      = 0;
@@ -1606,6 +1624,9 @@ void loop() {
                 ledFlashER();
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                 swAckValid   = false;
+                swWinHead    = 0;
+                dataTxSeq    = 0;
+                swAckedSeq   = 0;
                 kaInitiator  = false;
                 kaMissed     = 0;
                 kaLastPingMs = 0;
