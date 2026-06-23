@@ -37,7 +37,7 @@
  *   ATSETCH?         – query RF channel
  *   ATSSPEED=n       – set link speed: 0=250k, 1=1M, 2=2M
  *   ATSSPEED?        – query link speed
- *   ATD XXYYZZ       – dial / connect to remote MAC
+ *   ATD XXYYZZ       – dial / connect to remote MAC (returns BUSY if channel occupied and S14=1)
  *   ATA              – manually answer an incoming call
  *   ATH              – hang up / reject incoming call
  *   ATSn=value       – set S-register n to value (all saved to EEPROM):
@@ -50,6 +50,8 @@
  *                      S11 keep-alive interval seconds (default 5)
  *                      S12 missed pongs before drop (default 3)
  *                      S13 flow control: 0=none, 1=XON/XOFF (default 1)
+ *                      S14 busy detect enable: 1=on (default), 0=off
+ *                      S15 channel scan duration ms before dial (default 50)
  *   ATSn?            – query S-register n (returns zero-padded 3-digit value)
  *   AT&F            – factory reset: restore all defaults and overwrite EEPROM
  *   AT&Zn=string     – store dial string in slot n (n=0-3); AT&Zn= clears slot
@@ -77,7 +79,8 @@
  *                 PKT_NACK=0x07 (SWFLOW retransmit request),
  *                 PKT_SWACK=0x08 (SWFLOW cumulative ACK),
  *                 PKT_PING=0x09 (keep-alive ping),
- *                 PKT_PONG=0x0A (keep-alive reply)
+ *                 PKT_PONG=0x0A (keep-alive reply),
+ *                 PKT_SWACK_YIELD=0x0B (SWFLOW ACK + yield TX token to remote)
  *   [1]  seq    – rolling 0-255 sequence number
  *   [2]  length – number of payload bytes that follow (0-29)
  *   [3..31] payload
@@ -122,8 +125,9 @@
 #define PKT_ACK   0x06
 #define PKT_NACK  0x07   // SWFLOW: request retransmit of seq N
 #define PKT_SWACK 0x08   // SWFLOW: cumulative ACK up to seq N
-#define PKT_PING  0x09   // keep-alive ping  (initiator -> remote)
-#define PKT_PONG  0x0A   // keep-alive reply (remote   -> initiator)
+#define PKT_PING        0x09   // keep-alive ping  (initiator -> remote)
+#define PKT_PONG        0x0A   // keep-alive reply (remote   -> initiator)
+#define PKT_SWACK_YIELD 0x0B   // SWFLOW: cumulative ACK + yield TX to remote
 
 #define PAYLOAD_SIZE  32
 #define DATA_OFFSET    3
@@ -151,6 +155,8 @@
 #define EE_S11       86    // byte 86      S11: keep-alive interval (seconds)
 #define EE_S12       87    // byte 87      S12: missed keep-alives before drop
 #define EE_S13       88    // byte 88      S13: flow control mode (0=none, 1=XON/XOFF)
+#define EE_S14       89    // byte 89      S14: busy detect enable (1=on, 0=off)
+#define EE_S15       90    // byte 90      S15: channel scan duration ms
 
 #define DIAL_SLOTS      4
 #define DIAL_STR_LEN   16   // max chars, not counting NUL
@@ -179,6 +185,8 @@ uint8_t regS10       = 1;     // S10: keep-alive enable (1=on, 0=off)
 uint8_t regS11       = 5;     // S11: keep-alive interval (seconds)
 uint8_t regS12       = 3;     // S12: missed pongs before dropping connection
 uint8_t regS13       = 1;     // S13: flow control 0=none, 1=XON/XOFF (default ON)
+uint8_t regS14       = 1;     // S14: busy detect enable (1=on, 0=off)
+uint8_t regS15       = 50;    // S15: channel scan duration in ms (default 50)
 
 // Data-loss counters (reset by ATI or AT&F)
 uint32_t txDropped   = 0;    // bytes dropped: serial→radio direction (host sent too fast)
@@ -215,8 +223,9 @@ uint8_t cmdLen = 0;
 
 // XON/XOFF state
 bool hostXoffSent  = false;   // we told the host to stop
-bool radioXoffRecv = false;   // remote told us to stop
-bool radioXoffSent = false;   // we told remote to stop
+bool radioXoffRecv  = false;  // remote told us to stop
+bool radioXoffSent  = false;  // we told remote to stop
+bool yieldToRemote  = false;  // remote sent SWACK_YIELD — pause our TX, let them send
 
 // ── LED state ────────────────────────────────────────────────────────────────
 // SD and RD are monostable: they light for LED_FLASH_MS then go dark.
@@ -234,7 +243,7 @@ uint8_t txSeq = 0;
 uint8_t rxExpected = 0;
 
 // ACK mode
-bool    hwAck = true;   // true = hardware ACK (ATSHWACK=1), false = software flow (ATSHWACK=0)
+bool    hwAck = false;  // false = software flow (ATSHWACK=0, default); true = hardware ACK (ATSHWACK=1)
 
 // Baud rate table — index stored in EEPROM, not the raw value (saves 2 bytes).
 // Valid indices 0-7 matching baudTable[]. Default index 4 = 115200.
@@ -365,7 +374,7 @@ void loadConfig() {
     channel   = EEPROM.read(EE_CHANNEL);
     speedEnum = EEPROM.read(EE_SPEED);
     regS0     = EEPROM.read(EE_S0);
-    hwAck     = (EEPROM.read(EE_HWACK) != 0);
+    { uint8_t v = EEPROM.read(EE_HWACK); hwAck = (v == 0xFF) ? false : (v != 0); }
     uint8_t bi = EEPROM.read(EE_BAUD);
     baudIdx   = (bi < BAUD_TABLE_SIZE) ? bi : BAUD_DEFAULT;
 
@@ -383,7 +392,9 @@ void loadConfig() {
     regS10 = EEPROM.read(EE_S10); if (regS10 == 0xFF) regS10 = 1;
     regS11 = EEPROM.read(EE_S11); if (regS11 == 0xFF) regS11 = 5;
     regS12 = EEPROM.read(EE_S12); if (regS12 == 0xFF) regS12 = 3;
-    regS13 = EEPROM.read(EE_S13); if (regS13 > 1)      regS13 = 1;
+    regS13 = EEPROM.read(EE_S13); if (regS13 > 1)       regS13 = 1;
+    regS14 = EEPROM.read(EE_S14); if (regS14 > 1)       regS14 = 1;
+    regS15 = EEPROM.read(EE_S15); if (regS15 == 0 || regS15 == 0xFF) regS15 = 50;
 }
 
 void saveConfig() {
@@ -412,6 +423,8 @@ void saveConfig() {
     EEPROM.write(EE_S11,      regS11);
     EEPROM.write(EE_S12,      regS12);
     EEPROM.write(EE_S13,      regS13);
+    EEPROM.write(EE_S14,      regS14);
+    EEPROM.write(EE_S15,      regS15);
     EEPROM.write(EE_MAGIC,    EEPROM_MAGIC);
 }
 
@@ -544,6 +557,16 @@ void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
     if (radioXoffRecv) return;   // remote asked us to pause
 
+    // Cooperative duplex (SWFLOW only): remote sent SWACK_YIELD meaning it has
+    // data queued for us. Skip this TX turn so it can transmit without collision.
+    // Flag cleared here — remote gets exactly one uncontested TX slot per yield,
+    // then we resume normally next loop iteration.
+    // In HWACK mode yieldToRemote is never set so this path is never taken.
+    if (yieldToRemote) {
+        yieldToRemote = false;
+        return;
+    }
+
     while (txAvail() > 0) {
         // In SWFLOW mode, stop sending new packets when the window is full.
         if (!hwAck) {
@@ -641,6 +664,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaWaitingPong = false;
                 kaPingAt      = 0;
                 kaLastPingMs  = 0;
+                yieldToRemote = false;
                 state = S_IDLE;
                 openListenPipes();
                 sendNoCarrier();
@@ -697,6 +721,11 @@ void handleRadioPacket(const uint8_t *pkt) {
             kaWaitingPong = false;
             break;
 
+        case PKT_SWACK_YIELD:
+            // Remote ACKs our data AND requests we yield TX — it has data to send.
+            yieldToRemote = true;
+            // Fall through to normal SWACK window-advance logic.
+            /* fall through */
         case PKT_SWACK:
             // Cumulative ACK: remote has received everything up to and including seq N.
             if (!hwAck && len >= 1) {
@@ -739,12 +768,14 @@ void swflowAckData(uint8_t seq) {
             return;   // don't advance ackedSeq until gap is filled
         }
     }
-    // In-order: send cumulative SWACK.
+    // In-order: send SWACK. If we also have data pending, use PKT_SWACK_YIELD
+    // to ask the remote to pause its TX — cooperative half-duplex token passing.
     swAckedSeq = seq;
     swAckValid = true;
     uint8_t ackPkt[PAYLOAD_SIZE];
     memset(ackPkt, 0, PAYLOAD_SIZE);
-    ackPkt[0] = PKT_SWACK;
+    bool weHaveData = (txAvail() > 0) && !radioXoffRecv;
+    ackPkt[0] = weHaveData ? PKT_SWACK_YIELD : PKT_SWACK;
     ackPkt[1] = txSeq++;
     ackPkt[2] = 1;
     ackPkt[DATA_OFFSET] = seq;
@@ -782,7 +813,7 @@ void factoryReset() {
     remoteMac[0]= 0x00; remoteMac[1]= 0x00; remoteMac[2]= 0x00;
     channel     = 76;
     speedEnum   = 1;
-    hwAck       = true;
+    hwAck       = false;  // SWFLOW is default
     baudIdx     = BAUD_DEFAULT;
 
     // S-registers
@@ -795,6 +826,8 @@ void factoryReset() {
     regS11 = 5;
     regS12 = 3;
     regS13 = 1;
+    regS14 = 1;
+    regS15 = 50;
     txDropped = 0;
     rxDropped = 0;
 
@@ -816,6 +849,7 @@ void factoryReset() {
     kaWaitingPong  = false;
     kaPingAt       = 0;
     kaLastPingMs   = 0;
+    yieldToRemote  = false;
 
     // Persist — saveConfig() writes magic byte last
     saveConfig();
@@ -823,6 +857,28 @@ void factoryReset() {
     // Re-apply radio config at new settings
     applyRadioConfig();
     openListenPipes();
+}
+
+// ── Channel busy detection ───────────────────────────────────────────────────
+// Listens on the current channel for regS15 milliseconds, sampling the RPD
+// (Received Power Detector) register once per millisecond. The RPD asserts
+// when received signal strength exceeds -64 dBm — enough to catch any active
+// nRF24L01 link on the same channel (data, ACKs, keep-alive pings, all count).
+// Returns true if the channel appears occupied, false if clear.
+bool channelIsBusy() {
+    radio.startListening();
+    unsigned long start = millis();
+    uint8_t hits = 0;
+    uint8_t samples = 0;
+    while (millis() - start < (unsigned long)regS15) {
+        if (radio.testRPD()) hits++;
+        samples++;
+        delay(1);
+    }
+    openListenPipes();   // restore normal pipe config
+    // Busy if RPD fired on more than 20% of samples — reduces false positives
+    // from brief noise while still catching sustained link traffic.
+    return (hits > 0 && (hits * 100 / samples) >= 20);
 }
 
 // ── Command parser ────────────────────────────────────────────────────────────
@@ -897,6 +953,8 @@ void processCommand(const char *cmd) {
         Serial.print(F("S11     : ")); Serial.print(regS11); Serial.println(F(" s  (keep-alive interval)"));
         Serial.print(F("S12     : ")); Serial.print(regS12); Serial.println(F("    (missed pongs before drop)"));
         Serial.print(F("S13     : ")); Serial.println(regS13 == 1 ? F("1 (XON/XOFF enabled)") : F("0 (no flow control)"));
+        Serial.print(F("S14     : ")); Serial.println(regS14 == 1 ? F("1 (busy detect ON)") : F("0 (busy detect OFF)"));
+        Serial.print(F("S15     : ")); Serial.print(regS15); Serial.println(F(" ms (channel scan duration)"));
         Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (serial->radio, host overflow)"));
         Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (radio->serial, radio overflow)"));
         if (txDropped || rxDropped) Serial.println(F("** DATA LOSS DETECTED — consider enabling XON/XOFF (ATS13=1) **"));
@@ -954,6 +1012,7 @@ void processCommand(const char *cmd) {
         kaWaitingPong  = false;
         kaPingAt       = 0;
         kaLastPingMs   = 0;
+        yieldToRemote  = false;
         if (state == S_RINGING) {
             // Reject incoming call — send DISC back to caller using pending MAC.
             memcpy(remoteMac, pendingMac, 3);
@@ -1045,10 +1104,19 @@ void processCommand(const char *cmd) {
             strncpy(lastDialStr, cmd, sizeof(lastDialStr) - 1);
             lastDialStr[sizeof(lastDialStr) - 1] = '\0';
 
-            // S6: pre-dial wait. Short blocking delay — real Hayes behaviour.
-            // Keep it brief (max 255 s by spec, but we clamp to 10 for sanity).
+            // S6: pre-dial wait.
             uint8_t prewait = (regS6 > 10) ? 10 : regS6;
             if (prewait > 0) delay((uint16_t)prewait * 1000UL);
+
+            // S14: busy detect — scan channel before dialling.
+            if (regS14 == 1) {
+                if (channelIsBusy()) {
+                    Serial.println(F("BUSY"));
+                    ledFlashER();
+                    // Do not set S_CONNECTING — leave IDLE, no retry.
+                    return;
+                }
+            }
 
             state = S_CONNECTING;
 
@@ -1115,6 +1183,8 @@ void processCommand(const char *cmd) {
             case 11: regPtr = &regS11; break;
             case 12: regPtr = &regS12; break;
             case 13: regPtr = &regS13; break;
+            case 14: regPtr = &regS14; break;
+            case 15: regPtr = &regS15; break;
             default: sendError(); return;
         }
 
