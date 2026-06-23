@@ -108,13 +108,13 @@
 #define LED_ER_MS     400    // ER pulse width (ms)
 
 // ── Buffer sizes ──────────────────────────────────────────────────────────────
-#define RX_BUF_SIZE   128
-#define TX_BUF_SIZE   128
+#define RX_BUF_SIZE   256   // RX circular buffer (radio→serial). 982 B headroom allows 256.
+#define TX_BUF_SIZE   256   // TX circular buffer (serial→radio).
 #define CMD_BUF_SIZE   64
 
-// XON/XOFF thresholds (bytes in RX buffer)
-#define XOFF_THRESHOLD  96   // ~75 % of RX_BUF_SIZE → send XOFF
-#define XON_THRESHOLD   32   // ~25 % → send XON
+// XON/XOFF thresholds — recalculated for 256-byte buffers
+#define XOFF_THRESHOLD 192   // 75 % of RX_BUF_SIZE → send XOFF (~6.6 packets)
+#define XON_THRESHOLD   64   // 25 % of RX_BUF_SIZE → send XON
 
 // ── Packet types ──────────────────────────────────────────────────────────────
 #define PKT_DATA  0x01
