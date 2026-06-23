@@ -1597,8 +1597,11 @@ void loop() {
             // Timeout = S11 * S12 seconds — the full window the initiator would
             // exhaust before giving up. If we haven't seen a ping in that window
             // the initiator is gone (or their S10 was turned off mid-session).
+            // Use millis() directly here (not stale 'now') because kaLastPingMs
+            // may have been set mid-loop by doAnswer(), which would cause
+            // unsigned subtraction underflow with the pre-captured 'now'.
             unsigned long windowMs = (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
-            if (now - kaLastPingMs > windowMs) {
+            if (millis() - kaLastPingMs > windowMs) {
                 Serial.println(F("KA timeout - no pings received"));
                 ledFlashER();
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
