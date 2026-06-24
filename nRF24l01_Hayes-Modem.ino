@@ -92,7 +92,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.1.0"
+#define MODEM_VERSION "v1.3.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -271,7 +271,10 @@ unsigned long autoDialMs = 0;  // millis() timestamp to fire autodial
 // Holds up to SW_WIN_SIZE unacknowledged outbound packets so we can retransmit
 // on PKT_NACK. Each slot stores the raw 32-byte payload and a send timestamp.
 #define SW_WIN_SIZE   4
-#define SW_RETX_MS  150   // retransmit slot if no SWACK within 150 ms
+#define SW_RETX_MS  2000  // retransmit slot if no SWACK within 2 s (safety net only;
+                               //   primary recovery is NACK-based)
+#define SW_ACK_WAIT_MS  5  // ms to stay in RX after sending a data packet,
+                               //   giving the remote time to send its SWACK back
 
 struct SwSlot {
     uint8_t  pkt[PAYLOAD_SIZE];
@@ -597,6 +600,21 @@ void flushTxBuffer() {
         if (n == 0) break;
         if (!sendPacket(PKT_DATA, chunk, n)) {
             break;
+        }
+        // Brief RX window: stay in listen mode for SW_ACK_WAIT_MS so the
+        // remote's SWACK has a chance to arrive before we send the next packet.
+        // Without this, back-to-back TX calls keep the radio deaf and SWACKs
+        // are missed, causing the retransmit timer to fire unnecessarily.
+        if (!hwAck) {
+            unsigned long waitUntil = millis() + SW_ACK_WAIT_MS;
+            while (millis() < waitUntil) {
+                if (radio.available()) {
+                    uint8_t pkt[PAYLOAD_SIZE];
+                    radio.read(pkt, PAYLOAD_SIZE);
+                    handleRadioPacket(pkt);
+                    break;   // got something — exit wait early
+                }
+            }
         }
     }
 }
@@ -1662,12 +1680,12 @@ void loop() {
         // ── 11. SWFLOW: retransmit timed-out window slots ────────────────────────
     if (!hwAck && (state == S_DATA || state == S_CONNECTED)) {
         for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
-            if (swWin[i].used && (now - swWin[i].sentMs) >= SW_RETX_MS) {
+            if (swWin[i].used && (millis() - swWin[i].sentMs) >= SW_RETX_MS) {
                 openWritePipe(remoteMac);
                 bool ok = radio.write(swWin[i].pkt, PAYLOAD_SIZE);
                 if (ok) ledFlashSD(); else ledFlashER();
                 openListenPipes();
-                swWin[i].sentMs = now;
+                swWin[i].sentMs = millis();  // fresh timestamp, not stale now
             }
         }
     }
