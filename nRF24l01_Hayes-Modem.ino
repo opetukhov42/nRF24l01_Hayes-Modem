@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.12.0"
+#define MODEM_VERSION "v1.13.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -1347,6 +1347,14 @@ void processCommand(const char *cmd) {
         return;
     }
 
+    // ── ATSPECTRUM ──────────────────────────────────────────────────────────
+    // Must be checked BEFORE the generic ATSn handler — "ATSPECTRUM" starts
+    // with "ATS" and would otherwise be caught by the strncmp(uc,"ATS",3) check.
+    if (strcmp(uc, "ATSPECTRUM") == 0) {
+        spectrumScan();
+        return;
+    }
+
     // ── ATSn= / ATSn? — generic S-register handler ────────────────────────
     // Supported: S0 (auto-answer), S6 (pre-dial wait), S7 (carrier wait),
     //            S8 (retry count), S9 (retry interval seconds).
@@ -1501,12 +1509,6 @@ void processCommand(const char *cmd) {
         factoryReset();
         Serial.println(F("Factory reset complete."));
         sendOK();
-        return;
-    }
-
-    // ── ATSPECTRUM ──────────────────────────────────────────────────────────
-    if (strcmp(uc, "ATSPECTRUM") == 0) {
-        spectrumScan();
         return;
     }
 
