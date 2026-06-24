@@ -276,8 +276,10 @@ struct SwSlot {
 };
 SwSlot   swWin[SW_WIN_SIZE];
 uint8_t  swWinHead = 0;           // next slot to fill
-uint8_t  swAckedSeq = 0;          // last seq the remote confirmed
-bool     swAckValid = false;       // have we received any SWACK yet?
+uint8_t  swAckedSeq = 0;    // TX side: last dataTxSeq the remote confirmed via SWACK
+bool     swAckValid = false;    // TX side: have we received any SWACK yet?
+uint8_t  rxAckedSeq = 0;    // RX side: last incoming data seq we ACKed
+bool     rxAckValid = false;    // RX side: have we received any PKT_DATA yet?
 
 // Radio health
 bool     radioFailed   = false;  // set on init fail or runtime disconnect
@@ -667,6 +669,8 @@ void handleRadioPacket(const uint8_t *pkt) {
                 swWinHead     = 0;
                 dataTxSeq     = 0;
                 swAckedSeq    = 0;
+                rxAckValid    = false;
+                rxAckedSeq    = 0;
                 kaInitiator   = false;
                 kaMissed      = 0;
                 kaWaitingPong = false;
@@ -760,8 +764,8 @@ void handleRadioPacket(const uint8_t *pkt) {
 void swflowAckData(uint8_t seq) {
     if (hwAck) return;
 
-    if (swAckValid) {
-        uint8_t expected = (uint8_t)(swAckedSeq + 1);
+    if (rxAckValid) {
+        uint8_t expected = (uint8_t)(rxAckedSeq + 1);
         if (seq != expected) {
             // Gap detected — request the missing seq.
             uint8_t nackPkt[PAYLOAD_SIZE];
@@ -773,13 +777,13 @@ void swflowAckData(uint8_t seq) {
             openWritePipe(remoteMac);
             radio.write(nackPkt, PAYLOAD_SIZE);
             openListenPipes();
-            return;   // don't advance ackedSeq until gap is filled
+            return;   // don't advance rxAckedSeq until gap is filled
         }
     }
     // In-order: send SWACK. If we also have data pending, use PKT_SWACK_YIELD
     // to ask the remote to pause its TX — cooperative half-duplex token passing.
-    swAckedSeq = seq;
-    swAckValid = true;
+    rxAckedSeq = seq;
+    rxAckValid = true;
     uint8_t ackPkt[PAYLOAD_SIZE];
     memset(ackPkt, 0, PAYLOAD_SIZE);
     bool weHaveData = (txAvail() > 0) && !radioXoffRecv;
@@ -862,6 +866,8 @@ void factoryReset() {
     swWinHead      = 0;
     swAckedSeq     = 0;
     swAckValid     = false;
+    rxAckedSeq     = 0;
+    rxAckValid     = false;
 
     // Persist — saveConfig() writes magic byte last
     saveConfig();
@@ -1020,6 +1026,8 @@ void processCommand(const char *cmd) {
         swWinHead      = 0;
         dataTxSeq      = 0;
         swAckedSeq     = 0;
+        rxAckValid     = false;
+        rxAckedSeq     = 0;
         dialRetrying   = false;
         dialRetryCount = 0;
         kaInitiator    = false;
@@ -1592,6 +1600,8 @@ void loop() {
                     swWinHead     = 0;
                     dataTxSeq     = 0;
                     swAckedSeq    = 0;
+                    rxAckValid    = false;
+                    rxAckedSeq    = 0;
                     kaMissed      = 0;
                     kaWaitingPong = false;
                     kaPingAt      = 0;
@@ -1627,6 +1637,8 @@ void loop() {
                 swWinHead    = 0;
                 dataTxSeq    = 0;
                 swAckedSeq   = 0;
+                rxAckValid   = false;
+                rxAckedSeq   = 0;
                 kaInitiator  = false;
                 kaMissed     = 0;
                 kaLastPingMs = 0;
