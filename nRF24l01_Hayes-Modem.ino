@@ -40,6 +40,7 @@
  *   ATSSPEED?        – query link speed
  *   ATD XXYYZZ       – dial / connect to remote MAC (returns BUSY if channel occupied and S14=1)
  *   ATA              – manually answer an incoming call
+ *   ATO              – return to data mode after +++ escape
  *   ATH              – hang up / reject incoming call
  *   ATSn=value       – set S-register n to value (all saved to EEPROM):
  *                      S0  auto-answer rings (0=off)
@@ -95,7 +96,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.27.0"
+#define MODEM_VERSION "v1.29.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -810,6 +811,12 @@ void handleRadioPacket(const uint8_t *pkt) {
                 dialRetrying   = false;   // cancel any pending retry
                 dialRetryCount = 0;
                 clearBuffers();
+                // Reset all SWFLOW sequence state for the new session.
+                for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
+                swAckValid  = false;  swAckedSeq  = 0;
+                rxAckValid  = false;  rxAckedSeq  = 0;
+                swWinHead   = 0;      dataTxSeq   = 0;
+                yieldToRemote = false;
                 kaInitiator   = true;
                 kaMissed      = 0;
                 kaWaitingPong = false;
@@ -918,6 +925,12 @@ void doAnswer() {
     memcpy(remoteMac, pendingMac, 3);
     saveConfig();                  // persist new remote MAC
     clearBuffers();                // discard any stale pre-connect data
+    // Reset all SWFLOW sequence state for the new session.
+    for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
+    swAckValid  = false;  swAckedSeq  = 0;
+    rxAckValid  = false;  rxAckedSeq  = 0;
+    swWinHead   = 0;      dataTxSeq   = 0;
+    yieldToRemote = false;
     sendConnectAck();
     kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
     kaMissed      = 0;
@@ -1262,6 +1275,19 @@ void processCommand(const char *cmd) {
             Serial.println(dialStr[s][0] ? dialStr[s] : "(empty)");
         }
         sendOK();
+        return;
+    }
+
+    // ── ATO — return to data mode after +++ escape ───────────────────────────
+    if (strcmp(uc, "ATO") == 0 || strcmp(uc, "ATO0") == 0) {
+        if (state == S_CONNECTED) {
+            state = S_DATA;
+            sendConnect();   // Hayes standard: ATO confirms with CONNECT
+        } else if (state == S_DATA) {
+            sendConnect();   // already in data mode
+        } else {
+            sendError();     // no active connection to return to
+        }
         return;
     }
 
