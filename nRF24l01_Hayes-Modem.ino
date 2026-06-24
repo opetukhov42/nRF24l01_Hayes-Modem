@@ -32,6 +32,7 @@
  * AT commands:
  *   ATI              – print modem info (model, channel, own MAC, remote MAC, RSSI)
  *   ATSPECTRUM        – sweep all 126 channels, print ASCII spectrum, any key stops
+ *   ATPINGXXYYZZ      – send diagnostic ping to MAC XXYYZZ (idle only); prints PONG from XXXXXX
  *   ATTEST-TX         – speed test transmitter: flood packets with seq numbers
  *   ATTEST-RX         – speed test receiver: arm on magic, report stats every 1 s
  *   ATSMYMAC=XXYYZZ  – set own 3-byte MAC (hex, e.g. ATSMYMAC=A1B2C3)
@@ -87,6 +88,8 @@
  *                 PKT_PING=0x09 (keep-alive ping),
  *                 PKT_PONG=0x0A (keep-alive reply),
  *                 PKT_SWACK_YIELD=0x0B (SWFLOW ACK + yield TX token to remote)
+ *                 PKT_DIAG_PING=0x0C  (diagnostic ping, ATPING command)
+ *                 PKT_DIAG_PONG=0x0D  (diagnostic pong, reply to ATPING)
  *   [1]  seq    – rolling 0-255 sequence number
  *   [2]  length – number of payload bytes that follow (0-29)
  *   [3..31] payload
@@ -98,7 +101,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.42.0"
+#define MODEM_VERSION "v1.43.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -138,6 +141,8 @@
 #define PKT_PING        0x09   // keep-alive ping  (initiator -> remote)
 #define PKT_PONG        0x0A   // keep-alive reply (remote   -> initiator)
 #define PKT_SWACK_YIELD 0x0B   // SWFLOW: cumulative ACK + yield TX to remote
+#define PKT_DIAG_PING   0x0C   // diagnostic ping  (ATPING command, idle-only)
+#define PKT_DIAG_PONG   0x0D   // diagnostic pong  (reply to PKT_DIAG_PING)
 
 #define PAYLOAD_SIZE  32
 #define DATA_OFFSET    3
@@ -828,6 +833,43 @@ void handleRadioPacket(const uint8_t *pkt) {
             kaWaitingPong = false;
             break;
 
+        case PKT_DIAG_PING:
+            // Diagnostic ping received — only reply if we are fully idle.
+            // Print caller MAC (carried in payload bytes 0-2) and reply.
+            if (state == S_IDLE) {
+                Serial.print(F("\r\nPING from "));
+                if (len >= 3) {
+                    char macStr[7];
+                    snprintf(macStr, sizeof(macStr), "%02X%02X%02X",
+                             pkt[DATA_OFFSET], pkt[DATA_OFFSET+1], pkt[DATA_OFFSET+2]);
+                    Serial.println(macStr);
+                } else {
+                    Serial.println(F("unknown"));
+                }
+                // Reply with PKT_DIAG_PONG carrying our own MAC
+                uint8_t pong[PAYLOAD_SIZE];
+                memset(pong, 0, PAYLOAD_SIZE);
+                pong[0] = PKT_DIAG_PONG;
+                pong[1] = txSeq++;
+                pong[2] = 3;
+                pong[DATA_OFFSET]   = ownMac[0];
+                pong[DATA_OFFSET+1] = ownMac[1];
+                pong[DATA_OFFSET+2] = ownMac[2];
+                // Reply to sender's address (stored in pendingMac-style: use pkt source)
+                // We need the sender MAC — it's in the ping payload
+                if (len >= 3) {
+                    uint8_t senderMac[3] = {pkt[DATA_OFFSET], pkt[DATA_OFFSET+1], pkt[DATA_OFFSET+2]};
+                    openWritePipe(senderMac);
+                    radio.write(pong, PAYLOAD_SIZE);
+                    openListenPipes();
+                }
+            }
+            break;
+
+        case PKT_DIAG_PONG:
+            // Handled inline in atPing() wait loop — nothing to do here.
+            break;
+
         case PKT_SWACK_YIELD:
             // Remote ACKs our data AND wants a TX window.
             yieldToRemote = true;
@@ -1292,6 +1334,57 @@ void speedTestRX() {
     }
 
     state = S_CONNECTED;
+    sendOK();
+}
+
+// ── Diagnostic ping ──────────────────────────────────────────────────────────
+// Sends PKT_DIAG_PING to the target MAC and waits S7 seconds for PKT_DIAG_PONG.
+// Only callable from S_IDLE — no active or pending connection.
+void atPing(const uint8_t targetMac[3]) {
+    // Send PKT_DIAG_PING carrying our own MAC as payload
+    uint8_t ping[PAYLOAD_SIZE];
+    memset(ping, 0, PAYLOAD_SIZE);
+    ping[0] = PKT_DIAG_PING;
+    ping[1] = txSeq++;
+    ping[2] = 3;
+    ping[DATA_OFFSET]   = ownMac[0];
+    ping[DATA_OFFSET+1] = ownMac[1];
+    ping[DATA_OFFSET+2] = ownMac[2];
+
+    openWritePipe(targetMac);
+    bool sent = radio.write(ping, PAYLOAD_SIZE);
+    openListenPipes();
+
+    if (!sent) {
+        Serial.print(F("\r\nNO RESPONSE\r\n"));
+        sendOK();
+        return;
+    }
+
+    // Wait up to S7 seconds for PKT_DIAG_PONG
+    unsigned long deadline = millis() + (unsigned long)regS7 * 1000UL;
+    while (millis() < deadline) {
+        if (radio.available()) {
+            uint8_t pkt[PAYLOAD_SIZE];
+            radio.read(pkt, PAYLOAD_SIZE);
+            if (pkt[0] == PKT_DIAG_PONG) {
+                uint8_t len = pkt[2];
+                Serial.print(F("\r\nPONG from "));
+                if (len >= 3) {
+                    char macStr[7];
+                    snprintf(macStr, sizeof(macStr), "%02X%02X%02X",
+                             pkt[DATA_OFFSET], pkt[DATA_OFFSET+1], pkt[DATA_OFFSET+2]);
+                    Serial.println(macStr);
+                } else {
+                    Serial.println(F("unknown"));
+                }
+                sendOK();
+                return;
+            }
+            // Ignore anything else (stray packets on channel)
+        }
+    }
+    Serial.print(F("\r\nNO RESPONSE\r\n"));
     sendOK();
 }
 
@@ -1793,6 +1886,19 @@ void processCommand(const char *cmd) {
     // ── ATTEST-TX / ATTEST-RX ───────────────────────────────────────────────
     if (strcmp(uc, "ATTEST-TX") == 0) { speedTestTX(); return; }
     if (strcmp(uc, "ATTEST-RX") == 0) { speedTestRX(); return; }
+
+    // ── ATPING ──────────────────────────────────────────────────────────────
+    // Only available from S_IDLE — no active or pending connection.
+    if (strncmp(uc, "ATPING", 6) == 0 && strlen(uc) == 12) {
+        if (state != S_IDLE) {
+            Serial.print(F("\r\nERROR: ATPING only available when idle\r\n"));
+            return;
+        }
+        uint8_t mac[3];
+        if (!parseMac(uc + 6, mac)) { sendError(); return; }
+        atPing(mac);
+        return;
+    }
 
     // ── AT (bare) ───────────────────────────────────────────────────────────
     if (strcmp(uc, "AT") == 0) { sendOK(); return; }
