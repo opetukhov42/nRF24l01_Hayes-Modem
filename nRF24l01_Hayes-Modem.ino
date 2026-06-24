@@ -32,6 +32,8 @@
  * AT commands:
  *   ATI              – print modem info (model, channel, own MAC, remote MAC, RSSI)
  *   ATSPECTRUM        – sweep all 126 channels, print ASCII spectrum, any key stops
+ *   ATTEST-TX         – speed test transmitter: flood packets with seq numbers
+ *   ATTEST-RX         – speed test receiver: arm on magic, report stats every 1 s
  *   ATSMYMAC=XXYYZZ  – set own 3-byte MAC (hex, e.g. ATSMYMAC=A1B2C3)
  *   ATSMYMAC?        – query own MAC
  *   ATSETCH=nn       – set RF channel 0-125 (e.g. ATSETCH=76)
@@ -62,7 +64,7 @@
  *   AT&Zn?           – query stored dial string in slot n
  *   AT&Yn            – set startup autodial slot (fires 2 s after boot)
  *   AT&Y?            – query startup autodial slot
- *   ATSBAUD=n        – set baud rate (9600/19200/38400/57600/115200/250000/500000/1000000)
+ *   ATSBAUD=n        – set baud rate (2400/4800/9600/19200/38400/57600/115200/250000/500000/1000000)
  *                    OK is sent at old rate, then port switches — match your terminal!
  *   ATSBAUD?         – query current baud rate
  *   ATSFLOW=n        – set flow/ACK mode: 0=transparent (no framing/ACK), 1=HW ACK, 2=SW flow control (default)
@@ -96,7 +98,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.38.0"
+#define MODEM_VERSION "v1.42.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -272,13 +274,13 @@ unsigned long transLastByteMs = 0;   // millis() of last byte pushed to transBuf
 // TRANS_IDLE_MS replaced by S16 register (regS16) — see ATSn handler
 
 // Baud rate table — index stored in EEPROM, not the raw value (saves 2 bytes).
-// Valid indices 0-7 matching baudTable[]. Default index 4 = 115200.
+// Valid indices 0-9 matching baudTable[]. Default index 6 = 115200.
 const uint32_t baudTable[] = {
-    9600UL, 19200UL, 38400UL, 57600UL,
+    2400UL, 4800UL, 9600UL, 19200UL, 38400UL, 57600UL,
     115200UL, 250000UL, 500000UL, 1000000UL
 };
-const uint8_t  BAUD_TABLE_SIZE = 8;
-const uint8_t  BAUD_DEFAULT    = 4;   // 115200
+const uint8_t  BAUD_TABLE_SIZE = 10;
+const uint8_t  BAUD_DEFAULT    = 6;   // 115200
 uint8_t        baudIdx         = BAUD_DEFAULT;
 // Dial string profiles and startup autodial
 char    dialStr[DIAL_SLOTS][DIAL_STR_LEN + 1];  // "" = empty slot
@@ -296,6 +298,20 @@ unsigned long autoDialMs = 0;  // millis() timestamp to fire autodial
 
 uint8_t swLastPkt[PAYLOAD_SIZE];  // last sent PKT_DATA for retransmit
 bool    swLastPktValid = false;   // true when swLastPkt holds a valid packet
+uint32_t swRetxCount   = 0;       // total retransmit attempts this session
+
+// Radio health
+bool     radioFailed   = false;  // set on init fail or runtime disconnect
+unsigned long lastHealthMs = 0;  // last time we ran isChipConnected()
+#define HEALTH_INTERVAL_MS  500  // check every 500 ms
+
+// Escape sequence (+++) detection
+unsigned long lastDataMs = 0;    // millis() of last byte in data mode
+uint8_t  plusCount   = 0;        // count of consecutive '+' chars received
+bool     escapeArmed = false;    // true after first guard silence
+
+// SWFLOW duplicate detection
+uint8_t  rxLastSeq   = 0xFF;    // last accepted PKT_DATA seq (0xFF = none yet)
 
 // ── LED helpers ───────────────────────────────────────────────────────────────
 
@@ -636,6 +652,7 @@ void flushTxBuffer() {
         if (attempt == 0) {
             sendPacket(PKT_DATA, chunk, n);   // stores copy in swLastPkt
         } else if (swLastPktValid) {
+            swRetxCount++;
             openWritePipe(remoteMac);
             radio.write(swLastPkt, PAYLOAD_SIZE);
             ledFlashSD();
@@ -783,6 +800,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 yieldToRemote  = false;
                 swLastPktValid = false;
                 rxLastSeq      = 0xFF;
+                swRetxCount    = 0;
                 kaInitiator   = true;
                 kaMissed      = 0;
                 kaWaitingPong = false;
@@ -870,6 +888,7 @@ void doAnswer() {
     yieldToRemote  = false;
     swLastPktValid = false;
     rxLastSeq      = 0xFF;
+    swRetxCount    = 0;
     sendConnectAck();
     kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
     kaMissed      = 0;
@@ -1083,6 +1102,197 @@ bool channelIsBusy() {
     // Require at least 2 hits to declare busy — prevents single noise spikes
     // from blocking a dial attempt on what is actually a clear channel.
     return (hits >= 2);
+}
+
+// ── Speed test ───────────────────────────────────────────────────────────────
+// ATTEST-TX: flood PKT_DATA packets with embedded seq numbers to the remote.
+// ATTEST-RX: wait for the magic signature, then count received bytes/packets.
+//
+// Test packet payload layout (29 bytes):
+//   [0..3]  uint32_t sequence number (little-endian, starts at 0)
+//   [4..7]  uint32_t magic 0xDEADBEEF  ← RX arms on first packet with this magic
+//   [8..28] 0xAA fill
+//
+#define TEST_MAGIC  0xDEADBEEFUL
+#define TEST_PAY    MAX_DATA          // 29 bytes per packet
+#define TEST_STATS_MS  1000           // print stats every 1 s
+
+// Write a uint32 little-endian into a buffer
+static void writeU32(uint8_t *p, uint32_t v) {
+    p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
+}
+static uint32_t readU32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+}
+
+void speedTestTX() {
+    if (state != S_CONNECTED) {
+        Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
+        return;
+    }
+    Serial.print(F("\r\nATTEST-TX: sending — any key to stop\r\n"));
+
+    uint32_t seqNum     = 0;
+    uint32_t totalBytes = 0;
+    uint32_t retxStart  = swRetxCount;
+    uint32_t dropStart  = txDropped;
+    unsigned long testStart  = millis();
+    unsigned long lastStats  = testStart;
+
+    // Switch to data mode for the test
+    state = S_DATA;
+
+    while (true) {
+        // Check for keypress
+        if (Serial.available()) { Serial.read(); break; }
+
+        // Build test payload
+        uint8_t payload[TEST_PAY];
+        writeU32(payload,     seqNum);
+        writeU32(payload + 4, TEST_MAGIC);
+        memset(payload + 8, 0xAA, TEST_PAY - 8);
+
+        // Push into TX buffer — flushTxBuffer() will handle the actual send
+        for (uint8_t i = 0; i < TEST_PAY; i++) txPush(payload[i]);
+        flushTxBuffer();
+
+        totalBytes += TEST_PAY;
+        seqNum++;
+
+        // Print stats every TEST_STATS_MS
+        unsigned long now = millis();
+        if (now - lastStats >= TEST_STATS_MS) {
+            unsigned long elapsed = (now - testStart) / 1000UL;
+            uint32_t speed = elapsed ? (totalBytes / elapsed) : totalBytes;
+            Serial.print(F("[TX] t="));  Serial.print(elapsed);
+            Serial.print(F("s  pkts="));  Serial.print(seqNum);
+            Serial.print(F("  bytes="));  Serial.print(totalBytes);
+            Serial.print(F("  speed="));  Serial.print(speed);
+            Serial.print(F(" B/s  retx=")); Serial.print(swRetxCount - retxStart);
+            Serial.print(F("  drop="));   Serial.println(txDropped - dropStart);
+            lastStats = now;
+        }
+    }
+
+    // Final summary
+    unsigned long elapsed = (millis() - testStart);
+    uint32_t speed = elapsed ? (totalBytes * 1000UL / elapsed) : 0;
+    Serial.print(F("\r\n[TX DONE] pkts="));  Serial.print(seqNum);
+    Serial.print(F("  bytes="));  Serial.print(totalBytes);
+    Serial.print(F("  speed="));  Serial.print(speed);
+    Serial.print(F(" B/s  retx=")); Serial.print(swRetxCount - retxStart);
+    Serial.print(F("  drop="));   Serial.println(txDropped - dropStart);
+
+    state = S_CONNECTED;
+    sendOK();
+}
+
+void speedTestRX() {
+    if (state != S_CONNECTED) {
+        Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
+        return;
+    }
+    Serial.print(F("\r\nATTEST-RX: waiting for test stream — any key to stop\r\n"));
+
+    bool     armed       = false;
+    uint32_t expectedSeq = 0;
+    uint32_t totalBytes  = 0;
+    uint32_t lostPkts    = 0;
+    uint32_t dupPkts     = 0;   // retransmits that got through (seq < expected)
+    uint32_t recvPkts    = 0;
+    uint32_t dropStart   = rxDropped;
+    unsigned long testStart = 0;
+    unsigned long lastStats = 0;
+
+    // Switch to data mode so radio packets arrive via handleRadioPacket
+    state = S_DATA;
+
+    while (true) {
+        // Keypress stops test
+        if (Serial.available()) { Serial.read(); break; }
+
+        unsigned long now = millis();
+
+        // Drain radio
+        if (pendingPktReady) {
+            pendingPktReady = false;
+            handleRadioPacket(pendingPkt);
+        }
+        if (radio.available()) {
+            uint8_t pkt[PAYLOAD_SIZE];
+            radio.read(pkt, PAYLOAD_SIZE);
+            if (pkt[0] == PKT_DATA) {
+                uint8_t *pay = pkt + DATA_OFFSET;
+                uint32_t seq   = readU32(pay);
+                uint32_t magic = readU32(pay + 4);
+
+                if (!armed) {
+                    // Wait for the magic signature to arm
+                    if (magic == TEST_MAGIC) {
+                        armed       = true;
+                        expectedSeq = seq;
+                        testStart   = millis();
+                        lastStats   = testStart;
+                        Serial.print(F("[RX] armed on seq="));
+                        Serial.println(seq);
+                        // Send SWACK to keep sender going
+                        swflowAckData(pkt[1]);
+                    }
+                } else {
+                    if (seq == expectedSeq) {
+                        // In-order
+                        expectedSeq = seq + 1;
+                        totalBytes += (TEST_PAY - 8);
+                        recvPkts++;
+                    } else if (seq > expectedSeq) {
+                        // Gap — packets were lost
+                        lostPkts += seq - expectedSeq;
+                        expectedSeq = seq + 1;
+                        totalBytes += (TEST_PAY - 8);
+                        recvPkts++;
+                    } else {
+                        // seq < expectedSeq — duplicate (retransmit got through)
+                        dupPkts++;
+                        // Don't advance expectedSeq or count bytes again
+                    }
+                    swflowAckData(pkt[1]);
+                }
+            } else {
+                handleRadioPacket(pkt);
+            }
+        }
+
+        // Print stats every second (only after armed)
+        if (armed && (now - lastStats >= TEST_STATS_MS)) {
+            unsigned long elapsed = (now - testStart) / 1000UL;
+            uint32_t speed = elapsed ? (totalBytes / elapsed) : totalBytes;
+            Serial.print(F("[RX] t="));    Serial.print(elapsed);
+            Serial.print(F("s  pkts="));   Serial.print(recvPkts);
+            Serial.print(F("  bytes="));   Serial.print(totalBytes);
+            Serial.print(F("  speed="));   Serial.print(speed);
+            Serial.print(F(" B/s  lost=")); Serial.print(lostPkts);
+            Serial.print(F(" pkts  dup="));  Serial.print(dupPkts);
+            Serial.print(F("  drop="));      Serial.println(rxDropped - dropStart);
+            lastStats = now;
+        }
+    }
+
+    // Final summary
+    if (armed) {
+        unsigned long elapsed = millis() - testStart;
+        uint32_t speed = elapsed ? (totalBytes * 1000UL / elapsed) : 0;
+        Serial.print(F("\r\n[RX DONE] pkts="));  Serial.print(recvPkts);
+        Serial.print(F("  bytes="));   Serial.print(totalBytes);
+        Serial.print(F("  speed="));   Serial.print(speed);
+        Serial.print(F(" B/s  lost=")); Serial.print(lostPkts);
+        Serial.print(F(" pkts  dup="));  Serial.print(dupPkts);
+        Serial.print(F("  drop="));      Serial.println(rxDropped - dropStart);
+    } else {
+        Serial.print(F("\r\n[RX] no test stream received\r\n"));
+    }
+
+    state = S_CONNECTED;
+    sendOK();
 }
 
 // ── Command parser ────────────────────────────────────────────────────────────
@@ -1579,6 +1789,10 @@ void processCommand(const char *cmd) {
         sendOK();
         return;
     }
+
+    // ── ATTEST-TX / ATTEST-RX ───────────────────────────────────────────────
+    if (strcmp(uc, "ATTEST-TX") == 0) { speedTestTX(); return; }
+    if (strcmp(uc, "ATTEST-RX") == 0) { speedTestRX(); return; }
 
     // ── AT (bare) ───────────────────────────────────────────────────────────
     if (strcmp(uc, "AT") == 0) { sendOK(); return; }
