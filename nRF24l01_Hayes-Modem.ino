@@ -61,8 +61,8 @@
  *   ATSBAUD=n        – set baud rate (9600/19200/38400/57600/115200/250000/500000/1000000)
  *                    OK is sent at old rate, then port switches — match your terminal!
  *   ATSBAUD?         – query current baud rate
- *   ATSHWACK=n       – set ACK mode: 1=hardware ACK (default), 0=software flow control
- *   ATSHWACK?        – query ACK mode
+ *   ATSFLOW=n        – set flow/ACK mode: 0=none (reserved), 1=HW ACK, 2=SW flow control (default)
+ *   ATSFLOW?         – query flow mode
  *   ATE0 / ATE1      – echo off / on
  *   +++              – escape data mode → command mode (1 s guard time each side)
  *
@@ -92,7 +92,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.3.0"
+#define MODEM_VERSION "v1.7.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -144,7 +144,7 @@
 #define EE_SPEED      7    // byte  7    data rate enum
 #define EE_MAGIC      8    // byte  8    0xA5 if EEPROM valid
 #define EE_S0         9    // byte  9    S0 auto-answer ring count
-#define EE_HWACK     10    // byte 10    1=HWACK mode, 0=SWFLOW mode
+#define EE_FLOW      10    // byte 10    flow/ACK mode: 0=none, 1=HWACK, 2=SWFLOW
 #define EE_BAUD      11    // byte 11    baud rate index (see baudTable)
 #define EE_DIALSTR0  12    // bytes 12-28  dial string slot 0 (17 bytes incl NUL)
 #define EE_DIALSTR1  29    // bytes 29-45  dial string slot 1
@@ -247,8 +247,8 @@ uint8_t txSeq     = 0;    // sequence counter for ALL outbound packets
 uint8_t dataTxSeq = 0;    // sequence counter for PKT_DATA only (SWFLOW window)
 uint8_t rxExpected = 0;
 
-// ACK mode
-bool    hwAck = false;  // false = software flow (ATSHWACK=0, default); true = hardware ACK (ATSHWACK=1)
+// Flow / ACK mode: 0=none (reserved), 1=HWACK (hardware ACK), 2=SWFLOW (software flow control, default)
+uint8_t flowMode = 2;
 
 // Baud rate table — index stored in EEPROM, not the raw value (saves 2 bytes).
 // Valid indices 0-7 matching baudTable[]. Default index 4 = 115200.
@@ -384,7 +384,7 @@ void loadConfig() {
     channel   = EEPROM.read(EE_CHANNEL);
     speedEnum = EEPROM.read(EE_SPEED);
     regS0     = EEPROM.read(EE_S0);
-    { uint8_t v = EEPROM.read(EE_HWACK); hwAck = (v == 0xFF) ? false : (v != 0); }
+    { uint8_t v = EEPROM.read(EE_FLOW); flowMode = (v <= 2) ? v : 2; }
     uint8_t bi = EEPROM.read(EE_BAUD);
     baudIdx   = (bi < BAUD_TABLE_SIZE) ? bi : BAUD_DEFAULT;
 
@@ -417,7 +417,7 @@ void saveConfig() {
     EEPROM.write(EE_CHANNEL,  channel);
     EEPROM.write(EE_SPEED,    speedEnum);
     EEPROM.write(EE_S0,       regS0);
-    EEPROM.write(EE_HWACK,    hwAck ? 1 : 0);
+    EEPROM.write(EE_FLOW,     flowMode);
     EEPROM.write(EE_BAUD,     baudIdx);
     for (uint8_t s = 0; s < DIAL_SLOTS; s++) {
         uint8_t base = EE_DIALSTR0 + s * (DIAL_STR_LEN + 1);
@@ -450,12 +450,12 @@ void applyRadioConfig() {
     radio.setDataRate(speedToRate(speedEnum));
     radio.setPayloadSize(PAYLOAD_SIZE);
     radio.setPALevel(RF24_PA_MAX);
-    if (hwAck) {
+    if (flowMode == 1) {   // HWACK
         radio.setAutoAck(true);
         radio.setRetries(5, 15);   // 5 × 250 µs delay, up to 15 retries
-    } else {
+    } else {                   // SWFLOW (2) or none (0) — no hardware ACK
         radio.setAutoAck(false);
-        radio.setRetries(0, 0);    // no HW retries in SWFLOW mode
+        radio.setRetries(0, 0);
     }
 }
 
@@ -507,6 +507,14 @@ inline int txPop() {
     txTail %= TX_BUF_SIZE;
 }
 
+// ── Buffer flush ─────────────────────────────────────────────────────────────
+// Call on every disconnect and reconnect to prevent stale data from a previous
+// session leaking into the new one.
+void clearBuffers() {
+    rxHead = rxTail = 0;
+    txHead = txTail = 0;
+}
+
 // ── RSSI approximation ────────────────────────────────────────────────────────
 // nRF24L01 has no RSSI register; we use carrier detect (CD) on the
 // receive channel to indicate signal presence. For a rough dBm estimate
@@ -532,6 +540,17 @@ void sendNoCarrier() { Serial.println(F("NO CARRIER")); ledFlashER(); }
 void sendConnect()   { Serial.println(F("CONNECT")); }
 void sendRing()      { Serial.println(F("RING")); }
 
+// Print diagnostic/unsolicited text only when in CLI mode (not raw data mode).
+// In S_DATA the serial stream is raw — injecting text corrupts it.
+// S_CONNECTED = data mode but user has escaped via +++ so CLI is restored.
+inline bool inCliMode() { return state != S_DATA; }
+void cliPrint(const __FlashStringHelper *s)   { if (inCliMode()) Serial.print(s); }
+void cliPrintln(const __FlashStringHelper *s) { if (inCliMode()) Serial.println(s); }
+void cliPrint(uint8_t v)                      { if (inCliMode()) Serial.print(v); }
+void cliPrintln(uint8_t v)                    { if (inCliMode()) Serial.println(v); }
+void cliPrint(char c)                         { if (inCliMode()) Serial.print(c); }
+
+
 // ── Packet transmit ───────────────────────────────────────────────────────────
 bool sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
     uint8_t pkt[PAYLOAD_SIZE];
@@ -545,7 +564,7 @@ bool sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
     // In SWFLOW mode, store DATA packets in the retransmit window.
     // dataTxSeq is a data-only counter so window seq numbers are not
     // polluted by interleaved control packets (PING, PONG, SWACK etc.).
-    if (!hwAck && type == PKT_DATA) {
+    if (flowMode == 2 && type == PKT_DATA) {
         pkt[1] = dataTxSeq;          // overwrite with data-only seq
         uint8_t slotIdx = swWinHead % SW_WIN_SIZE;
         memcpy(swWin[slotIdx].pkt, pkt, PAYLOAD_SIZE);
@@ -575,7 +594,7 @@ void flushTxBuffer() {
     // data queued for us. Skip this TX turn so it can transmit without collision.
     // Flag cleared here — remote gets exactly one uncontested TX slot per yield,
     // then we resume normally next loop iteration.
-    // In HWACK mode yieldToRemote is never set so this path is never taken.
+    // In HWACK/none mode yieldToRemote is never set so this path is never taken.
     if (yieldToRemote) {
         yieldToRemote = false;
         return;
@@ -583,7 +602,7 @@ void flushTxBuffer() {
 
     while (txAvail() > 0) {
         // In SWFLOW mode, stop sending new packets when the window is full.
-        if (!hwAck) {
+        if (flowMode == 2) {
             uint8_t inFlight = 0;
             for (uint8_t i = 0; i < SW_WIN_SIZE; i++)
                 if (swWin[i].used) inFlight++;
@@ -605,7 +624,7 @@ void flushTxBuffer() {
         // remote's SWACK has a chance to arrive before we send the next packet.
         // Without this, back-to-back TX calls keep the radio deaf and SWACKs
         // are missed, causing the retransmit timer to fire unnecessarily.
-        if (!hwAck) {
+        if (flowMode == 2) {
             unsigned long waitUntil = millis() + SW_ACK_WAIT_MS;
             while (millis() < waitUntil) {
                 if (radio.available()) {
@@ -658,7 +677,7 @@ void handleRadioPacket(const uint8_t *pkt) {
         case PKT_DATA:
             if (state == S_DATA || state == S_CONNECTED) {
                 ledFlashRD();
-                swflowAckData(pkt[1]);   // no-op in HWACK mode
+                swflowAckData(pkt[1]);   // no-op unless SWFLOW mode
                 for (uint8_t i = 0; i < len && i < MAX_DATA; i++) {
                     rxPush(pkt[DATA_OFFSET + i]);
                 }
@@ -686,6 +705,7 @@ void handleRadioPacket(const uint8_t *pkt) {
 
         case PKT_DISC:
             if (state == S_DATA || state == S_CONNECTED) {
+                clearBuffers();
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                 swAckValid    = false;
                 swWinHead     = 0;
@@ -716,6 +736,7 @@ void handleRadioPacket(const uint8_t *pkt) {
         case PKT_ACK:
             // handshake ack during ATD
             if (state == S_CONNECTING) {
+                clearBuffers();         // discard stale pre-connect data
                 state         = S_DATA;
                 kaInitiator   = true;   // we dialled — we own keep-alive
                 kaMissed      = 0;
@@ -727,7 +748,7 @@ void handleRadioPacket(const uint8_t *pkt) {
 
         case PKT_NACK:
             // Remote detected a gap — retransmit the requested seq from our window.
-            if (!hwAck && len >= 1) {
+            if (flowMode == 2 && len >= 1) {
                 uint8_t wantSeq = pkt[DATA_OFFSET];
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
                     if (swWin[i].used && swWin[i].pkt[1] == wantSeq) {
@@ -762,7 +783,7 @@ void handleRadioPacket(const uint8_t *pkt) {
             /* fall through */
         case PKT_SWACK:
             // Cumulative ACK: remote has received everything up to and including seq N.
-            if (!hwAck && len >= 1) {
+            if (flowMode == 2 && len >= 1) {
                 uint8_t ackedSeq = pkt[DATA_OFFSET];
                 swAckedSeq  = ackedSeq;
                 swAckValid  = true;
@@ -784,7 +805,7 @@ void handleRadioPacket(const uint8_t *pkt) {
 // Called from handleRadioPacket for every PKT_DATA in SWFLOW mode.
 // Sends a NACK if a gap is detected, then a SWACK after each in-order packet.
 void swflowAckData(uint8_t seq) {
-    if (hwAck) return;
+    if (flowMode != 2) return;   // SWACK only used in SWFLOW mode
 
     if (rxAckValid) {
         uint8_t expected = (uint8_t)(rxAckedSeq + 1);
@@ -823,6 +844,7 @@ void swflowAckData(uint8_t seq) {
 void doAnswer() {
     memcpy(remoteMac, pendingMac, 3);
     saveConfig();                  // persist new remote MAC
+    clearBuffers();                // discard any stale pre-connect data
     sendConnectAck();
     state         = S_DATA;
     kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
@@ -847,7 +869,7 @@ void factoryReset() {
     remoteMac[0]= 0x00; remoteMac[1]= 0x00; remoteMac[2]= 0x00;
     channel     = 76;
     speedEnum   = 1;
-    hwAck       = false;  // SWFLOW is default
+    flowMode    = 2;      // SWFLOW is default
     baudIdx     = BAUD_DEFAULT;
 
     // S-registers
@@ -884,6 +906,7 @@ void factoryReset() {
     kaPingAt       = 0;
     kaLastPingMs   = 0;
     yieldToRemote  = false;
+    clearBuffers();
     dataTxSeq      = 0;
     swWinHead      = 0;
     swAckedSeq     = 0;
@@ -970,7 +993,10 @@ void processCommand(const char *cmd) {
         }
 
         Serial.print(F("Baud    : ")); Serial.println(baudTable[baudIdx]);
-        Serial.print(F("ACK mode: ")); Serial.println(hwAck ? F("HWACK (ATSHWACK=1)") : F("SWFLOW (ATSHWACK=0)"));
+        Serial.print(F("Flow mode: "));
+        if      (flowMode == 0) Serial.println(F("0 (none - reserved)"));
+        else if (flowMode == 1) Serial.println(F("1 (HWACK - hardware ACK)"));
+        else                    Serial.println(F("2 (SWFLOW - software flow control)"));
         Serial.print(F("Channel : ")); Serial.println(channel);
         Serial.print(F("Speed   : "));
         if      (speedEnum == 0) Serial.println(F("250 kbps"));
@@ -1043,7 +1069,8 @@ void processCommand(const char *cmd) {
 
     // ── ATH ─────────────────────────────────────────────────────────────────
     if (strcmp(uc, "ATH") == 0 || strcmp(uc, "ATH0") == 0) {
-        // Clear SWFLOW window and cancel any pending retry on hangup.
+        // Clear SWFLOW window, buffers, and cancel any pending retry on hangup.
+        clearBuffers();
         for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
         swAckValid     = false;
         swWinHead      = 0;
@@ -1326,16 +1353,18 @@ void processCommand(const char *cmd) {
         return;
     }
 
-    // ── ATSHWACK? / ATSHWACK=n ─────────────────────────────────────────────
-    if (strcmp(uc, "ATSHWACK?") == 0) {
-        Serial.println(hwAck ? F("1 (hardware ACK)") : F("0 (software flow control)"));
+    // ── ATSFLOW? / ATSFLOW=n ────────────────────────────────────────────────
+    if (strcmp(uc, "ATSFLOW?") == 0) {
+        if      (flowMode == 0) Serial.println(F("0 (none - reserved)"));
+        else if (flowMode == 1) Serial.println(F("1 (HWACK)"));
+        else                    Serial.println(F("2 (SWFLOW)"));
         sendOK();
         return;
     }
-    if (strncmp(uc, "ATSHWACK=", 9) == 0) {
-        int val = atoi(uc + 9);
-        if (val == 0 || val == 1) {
-            hwAck = (val == 1);
+    if (strncmp(uc, "ATSFLOW=", 8) == 0) {
+        int val = atoi(uc + 8);
+        if (val >= 0 && val <= 2) {
+            flowMode = (uint8_t)val;
             // Clear SWFLOW window when switching modes.
             for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
             swAckValid = false;
@@ -1410,7 +1439,7 @@ void checkRadioHealth() {
 
     if (!radio.isChipConnected()) {
         radioFailed = true;
-        Serial.println(F("ERROR: nRF24L01 disconnected."));
+        cliPrintln(F("ERROR: nRF24L01 disconnected."));
 
         // Drop any active connection gracefully (best-effort; radio may be gone)
         if (state != S_IDLE) {
@@ -1473,8 +1502,8 @@ void loop() {
         if (state == S_IDLE) {
             char fakeCmd[DIAL_STR_LEN + 5];
             snprintf(fakeCmd, sizeof(fakeCmd), "ATD %s", dialStr[startupSlot]);
-            Serial.print(F("Autodialling: "));
-            Serial.println(dialStr[startupSlot]);
+            cliPrint(F("Autodialling: "));
+            if (inCliMode()) Serial.println(dialStr[startupSlot]);
             processCommand(fakeCmd);
         }
     }
@@ -1545,10 +1574,10 @@ void loop() {
                 dialRetryCount++;
                 dialRetrying = true;
                 dialRetryAt  = now + (unsigned long)regS9 * 1000UL;
-                Serial.print(F("NO CARRIER - retry "));
-                Serial.print(dialRetryCount);
-                Serial.print(F("/"));
-                Serial.println(regS8);
+                cliPrint(F("NO CARRIER - retry "));
+                cliPrint(dialRetryCount);
+                cliPrint(F("/"));
+                cliPrintln(regS8);
                 ledFlashER();
             } else {
                 // Exhausted retries (or S8=0).
@@ -1566,11 +1595,11 @@ void loop() {
     // Fire a pending retry when S9 interval expires.
     if (dialRetrying && now >= dialRetryAt) {
         dialRetrying = false;
-        Serial.print(F("Redialling (attempt "));
-        Serial.print(dialRetryCount);
-        Serial.print(F("/"));
-        Serial.print(regS8);
-        Serial.println(F(")..."));
+        cliPrint(F("Redialling (attempt "));
+        cliPrint(dialRetryCount);
+        cliPrint(F("/"));
+        cliPrint(regS8);
+        cliPrintln(F(")..."));
         processCommand(lastDialStr);
     }
 
@@ -1614,12 +1643,13 @@ void loop() {
         if (now >= kaPingAt) {
             if (kaWaitingPong) {
                 kaMissed++;
-                Serial.print(F("KA miss "));
-                Serial.print(kaMissed);
-                Serial.print('/');
-                Serial.println(regS12);
+                cliPrint(F("KA miss "));
+                cliPrint(kaMissed);
+                cliPrint('/');
+                cliPrintln(regS12);
                 ledFlashER();
                 if (kaMissed >= regS12) {
+                    clearBuffers();
                     for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                     swAckValid    = false;
                     swWinHead     = 0;
@@ -1655,8 +1685,9 @@ void loop() {
             // unsigned subtraction underflow with the pre-captured 'now'.
             unsigned long windowMs = (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
             if (millis() - kaLastPingMs > windowMs) {
-                Serial.println(F("KA timeout - no pings received"));
+                cliPrintln(F("KA timeout - no pings received"));
                 ledFlashER();
+                clearBuffers();
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                 swAckValid   = false;
                 swWinHead    = 0;
@@ -1678,7 +1709,7 @@ void loop() {
     }
 
         // ── 11. SWFLOW: retransmit timed-out window slots ────────────────────────
-    if (!hwAck && (state == S_DATA || state == S_CONNECTED)) {
+    if (flowMode == 2 && (state == S_DATA || state == S_CONNECTED)) {
         for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
             if (swWin[i].used && (millis() - swWin[i].sentMs) >= SW_RETX_MS) {
                 openWritePipe(remoteMac);
