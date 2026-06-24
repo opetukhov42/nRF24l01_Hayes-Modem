@@ -31,6 +31,7 @@
  *
  * AT commands:
  *   ATI              – print modem info (model, channel, own MAC, remote MAC, RSSI)
+ *   ATSPECTRUM        – sweep all 126 channels, print ASCII spectrum, any key stops
  *   ATSMYMAC=XXYYZZ  – set own 3-byte MAC (hex, e.g. ATSMYMAC=A1B2C3)
  *   ATSMYMAC?        – query own MAC
  *   ATSETCH=nn       – set RF channel 0-125 (e.g. ATSETCH=76)
@@ -53,6 +54,7 @@
  *                      S14 busy detect enable: 1=on (default), 0=off
  *                      S15 channel scan duration ms before dial (default 50)
  *                      S16 transparent mode TX idle flush ms (default 5)
+ *                      S17 spectrum scan dwell ms per channel (default 20)
  *   ATSn?            – query S-register n (returns zero-padded 3-digit value)
  *   AT&F            – factory reset: restore all defaults and overwrite EEPROM
  *   AT&Zn=string     – store dial string in slot n (n=0-3); AT&Zn= clears slot
@@ -93,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.9.0"
+#define MODEM_VERSION "v1.12.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -163,6 +165,7 @@
 #define EE_S14       89    // byte 89      S14: busy detect enable (1=on, 0=off)
 #define EE_S15       90    // byte 90      S15: channel scan duration ms
 #define EE_S16       91    // byte 91      S16: transparent mode TX idle flush ms
+#define EE_S17       92    // byte 92      S17: spectrum scan dwell ms per channel
 
 #define DIAL_SLOTS      4
 #define DIAL_STR_LEN   16   // max chars, not counting NUL
@@ -179,7 +182,7 @@ ModemState state = S_IDLE;
 
 uint8_t ownMac[3]    = {0x01, 0x02, 0x03};
 uint8_t remoteMac[3] = {0x00, 0x00, 0x00};
-uint8_t channel      = 76;
+uint8_t channel      = 97;   // 2497 MHz — above WiFi (max ch14=2484) and Bluetooth (max 2480)
 uint8_t speedEnum    = 1;   // 0=250k 1=1M 2=2M
 bool    echoOn       = true;
 uint8_t regS0        = 0;     // S0 register: 0=manual answer, 1+=auto-answer after n rings
@@ -194,6 +197,7 @@ uint8_t regS13       = 1;     // S13: flow control 0=none, 1=XON/XOFF (default O
 uint8_t regS14       = 1;     // S14: busy detect enable (1=on, 0=off)
 uint8_t regS15       = 50;    // S15: channel scan duration in ms (default 50)
 uint8_t regS16       = 5;     // S16: transparent mode TX idle flush ms (default 5)
+uint8_t regS17       = 20;    // S17: spectrum scan dwell ms per channel (default 20)
 
 // Data-loss counters (reset by ATI or AT&F)
 uint32_t txDropped   = 0;    // bytes dropped: serial→radio direction (host sent too fast)
@@ -417,6 +421,7 @@ void loadConfig() {
     regS14 = EEPROM.read(EE_S14); if (regS14 > 1)       regS14 = 1;
     regS15 = EEPROM.read(EE_S15); if (regS15 == 0 || regS15 == 0xFF) regS15 = 50;
     regS16 = EEPROM.read(EE_S16); if (regS16 == 0 || regS16 == 0xFF) regS16 = 5;
+    regS17 = EEPROM.read(EE_S17); if (regS17 == 0 || regS17 == 0xFF) regS17 = 20;
 }
 
 void saveConfig() {
@@ -448,6 +453,7 @@ void saveConfig() {
     EEPROM.write(EE_S14,      regS14);
     EEPROM.write(EE_S15,      regS15);
     EEPROM.write(EE_S16,      regS16);
+    EEPROM.write(EE_S17,      regS17);
     EEPROM.write(EE_MAGIC,    EEPROM_MAGIC);
 }
 
@@ -880,7 +886,7 @@ void factoryReset() {
     // Radio / link settings
     ownMac[0]   = 0x01; ownMac[1]   = 0x02; ownMac[2]   = 0x03;
     remoteMac[0]= 0x00; remoteMac[1]= 0x00; remoteMac[2]= 0x00;
-    channel     = 76;
+    channel     = 97;   // 2497 MHz — above all WiFi and Bluetooth
     speedEnum   = 1;
     flowMode    = 2;      // SWFLOW is default
     baudIdx     = BAUD_DEFAULT;
@@ -898,6 +904,7 @@ void factoryReset() {
     regS14 = 1;
     regS15 = 50;
     regS16 = 5;
+    regS17 = 20;
     txDropped = 0;
     rxDropped = 0;
 
@@ -936,7 +943,91 @@ void factoryReset() {
     openListenPipes();
 }
 
-// ── Channel busy detection ───────────────────────────────────────────────────
+// ── Spectrum scanner ─────────────────────────────────────────────────────────
+// Sweeps all 126 nRF24L01 channels (0-125), sampling RPD for S17 (regS17) ms
+// per channel, converts hit density to an ASCII character, and streams the
+// result to serial. Prints a ruler header before each sweep. Runs until any
+// serial byte is received.
+//
+// Density map (RPD hits out of ~regS17 samples):
+//   0        → ' '  (no signal)
+//   1–2      → '.'
+//   3–4      → ':'
+//   5–6      → '-'
+//   7–8      → '='
+//   9–10     → '+'
+//   11–13    → '*'
+//   14–16    → '#'
+//   17–19    → '@'
+//   20+      → '%'  (saturated)
+//
+// Ruler printed every sweep:
+//   |         1         2  ...  (tens)
+//   0123456789012345678901234...  (units)
+
+// SPECTRUM_DWELL_MS replaced by S17 register (regS17) — see ATSn handler
+
+void spectrumScan() {
+    if (state != S_IDLE && state != S_CONNECTED) {
+        Serial.println(F("ERROR: disconnect first"));
+        return;
+    }
+
+    Serial.println(F("SPECTRUM SCAN — any key to stop"));
+    Serial.println(F("Ch:  0         1         2         3         4         5         6         7         8         9         10        11        12"));
+    Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
+
+    // Density to ASCII lookup
+    static const char density[] = " .:-=+*#@%";
+    //                              0 1  2  3  4  5  6  7  8  9+
+
+    radio.stopListening();
+
+    while (true) {
+        // Check for keypress — any byte stops the scan
+        if (Serial.available()) {
+            Serial.read();   // consume the byte
+            break;
+        }
+
+        Serial.print(F("     "));   // indent to align with ruler
+
+        for (uint8_t ch = 0; ch < 126; ch++) {
+            radio.setChannel(ch);
+            delayMicroseconds(130);   // settling time after channel switch
+
+            // Sample RPD for regS17 milliseconds
+            uint8_t hits = 0;
+            unsigned long start = millis();
+            while (millis() - start < (unsigned long)regS17) {
+                if (radio.testRPD()) hits++;
+                delay(1);
+            }
+
+            // Map hits to density character (clamp to index 9)
+            uint8_t idx = hits / 2;          // 0-1→0, 2-3→1, 4-5→2 ...
+            if (idx > 9) idx = 9;
+            Serial.write(density[idx]);
+
+            // Check for keypress between channels too
+            if (Serial.available()) {
+                Serial.read();
+                goto scan_done;
+            }
+        }
+        Serial.println();   // end of sweep — CR+LF, start new line
+    }
+
+scan_done:
+    // Restore radio to configured channel and return to listen mode
+    radio.setChannel(channel);
+    applyRadioConfig();
+    openListenPipes();
+    Serial.println();
+    sendOK();
+}
+
+// ── Channel busy detection ─────────────────────────────────────────────────────
 // Listens on the current channel for regS15 milliseconds, sampling the RPD
 // (Received Power Detector) register once per millisecond. The RPD asserts
 // when received signal strength exceeds -64 dBm — enough to catch any active
@@ -1037,6 +1128,7 @@ void processCommand(const char *cmd) {
         Serial.print(F("S14     : ")); Serial.println(regS14 == 1 ? F("1 (busy detect ON)") : F("0 (busy detect OFF)"));
         Serial.print(F("S15     : ")); Serial.print(regS15); Serial.println(F(" ms (channel scan duration)"));
         Serial.print(F("S16     : ")); Serial.print(regS16); Serial.println(F(" ms (transparent TX idle flush)"));
+        Serial.print(F("S17     : ")); Serial.print(regS17); Serial.println(F(" ms (spectrum scan dwell per channel)"));
         Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (serial->radio, host overflow)"));
         Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (radio->serial, radio overflow)"));
         if (txDropped || rxDropped) Serial.println(F("** DATA LOSS DETECTED — consider enabling XON/XOFF (ATS13=1) **"));
@@ -1284,6 +1376,7 @@ void processCommand(const char *cmd) {
             case 14: regPtr = &regS14; break;
             case 15: regPtr = &regS15; break;
             case 16: regPtr = &regS16; break;
+            case 17: regPtr = &regS17; break;
             default: sendError(); return;
         }
 
@@ -1408,6 +1501,12 @@ void processCommand(const char *cmd) {
         factoryReset();
         Serial.println(F("Factory reset complete."));
         sendOK();
+        return;
+    }
+
+    // ── ATSPECTRUM ──────────────────────────────────────────────────────────
+    if (strcmp(uc, "ATSPECTRUM") == 0) {
+        spectrumScan();
         return;
     }
 
