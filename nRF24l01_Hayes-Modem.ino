@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.24.0"
+#define MODEM_VERSION "v1.25.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -220,9 +220,8 @@ char     lastDialStr[DIAL_STR_LEN + 5]; // "ATD XXYYZZ" copy for retransmission
 
 // Incoming call state (used while S_RINGING)
 uint8_t  pendingMac[3]  = {0, 0, 0};  // MAC of the caller waiting to be answered
-uint8_t  ringCount       = 0;          // how many RING responses sent so far
-unsigned long ringTimer  = 0;          // millis() of next RING output
-unsigned long lastConnMs = 0;          // millis() of last PKT_CONN received (ring timeout)
+uint8_t  ringCount   = 0;   // how many RINGs sent (for S0 auto-answer threshold)
+unsigned long lastConnMs = 0;  // millis() of last PKT_CONN received (ring timeout)
 
 // Circular buffers
 uint8_t rxBuf[RX_BUF_SIZE];
@@ -751,15 +750,18 @@ void handleRadioPacket(const uint8_t *pkt) {
                 } else {
                     memset(pendingMac, 0, 3);
                 }
-                lastConnMs = millis();   // refresh ring timeout on every PKT_CONN
-                if (state == S_IDLE) {
-                    // Fresh call — reset ring cadence
-                    ringCount = 0;
-                    ringTimer = 0;    // fire first RING immediately
-                }
-                // If already S_RINGING: keep ringing, just refresh pendingMac.
-                // Do NOT reset ringCount — avoids re-triggering auto-answer delay.
+                lastConnMs = millis();
+                if (state == S_IDLE) ringCount = 0;  // fresh call
                 state = S_RINGING;
+                // Print RING immediately on packet receipt — no cadence timer.
+                // This ensures RING only appears when a real PKT_CONN arrives,
+                // not on a timer that keeps firing after the caller is gone.
+                sendRing();
+                ringCount++;
+                // Auto-answer if S0 threshold reached.
+                if (regS0 > 0 && ringCount >= regS0) {
+                    doAnswer();
+                }
             }
             break;
 
@@ -1281,7 +1283,6 @@ void processCommand(const char *cmd) {
             sendControlPacket(PKT_DISC);
             memset(remoteMac, 0, 3);
             ringCount  = 0;
-            ringTimer  = 0;
             lastConnMs = 0;
             state = S_IDLE;
             openListenPipes();
@@ -1892,10 +1893,10 @@ void loop() {
     // ── 8. Flow control check ────────────────────────────────────────────────
     checkFlowControl();
 
-    // ── 9. Ring cadence, auto-answer, and ring timeout ───────────────────────
-    // Ring timeout: if no PKT_CONN received for longer than the caller's full
-    // retry window, the caller has gone — stop ringing and return to IDLE.
-    // Window = (S8+1) attempts × S7 s each + S8 gaps × S9 s + 2 s margin.
+    // ── 9. Ring timeout ──────────────────────────────────────────────────────
+    // RING is now printed directly in the PKT_CONN handler, once per packet.
+    // This block only handles timeout: if no PKT_CONN arrives within the
+    // caller's full retry window, silently return to IDLE.
     if (state == S_RINGING && lastConnMs != 0) {
         unsigned long ringTimeoutMs =
             (unsigned long)(regS8 + 1) * (unsigned long)regS7 * 1000UL
@@ -1904,20 +1905,9 @@ void loop() {
         if (millis() - lastConnMs > ringTimeoutMs) {
             state      = S_IDLE;
             ringCount  = 0;
-            ringTimer  = 0;
             lastConnMs = 0;
             openListenPipes();
             cliPrintln(F("NO ANSWER"));
-        }
-    }
-    if (state == S_RINGING && (ringTimer == 0 || now >= ringTimer)) {
-        ringCount++;
-        sendRing();
-        ringTimer = now + 2000;   // Hayes standard: RING every ~2 s
-
-        // Auto-answer if S0 is set and we've hit the ring threshold.
-        if (regS0 > 0 && ringCount >= regS0) {
-            doAnswer();
         }
     }
 
