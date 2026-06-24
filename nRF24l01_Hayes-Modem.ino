@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.25.0"
+#define MODEM_VERSION "v1.27.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -1117,9 +1117,14 @@ bool channelIsBusy() {
 
     uint8_t hits = 0;
     for (uint8_t i = 0; i < samples; i++) {
-        // startListening() resets the RPD latch — each call is a fresh reading.
+        // Must cycle through standby to guarantee RPD latch resets.
+        // Calling startListening() when already in RX mode is a no-op on
+        // nRF24L01 — the latch from the last received packet stays set.
+        // stopListening() → startListening() forces the full RX re-arm.
+        radio.stopListening();
+        delayMicroseconds(130);      // standby settle
         radio.startListening();
-        delayMicroseconds(1800);     // datasheet: ~170 µs min; 1800 µs is safe
+        delayMicroseconds(1800);     // RX settle + RPD comparator valid
         if (radio.testRPD()) hits++;
     }
 
@@ -1179,6 +1184,15 @@ void processCommand(const char *cmd) {
         }
 
         Serial.print(F("Baud    : ")); Serial.println(baudTable[baudIdx]);
+        Serial.print(F("State   : "));
+        switch (state) {
+            case S_IDLE:       Serial.println(F("IDLE"));                break;
+            case S_RINGING:    Serial.println(F("RINGING"));             break;
+            case S_CONNECTING: Serial.println(F("CONNECTING (dialling)")); break;
+            case S_CONNECTED:  Serial.println(F("CONNECTED (CLI mode)")); break;
+            case S_DATA:       Serial.println(F("CONNECTED (data mode)")); break;
+            default:           Serial.println(F("UNKNOWN"));             break;
+        }
         Serial.print(F("Flow mode: "));
         if      (flowMode == 0) Serial.println(F("0 (transparent - no framing)"));
         else if (flowMode == 1) Serial.println(F("1 (HWACK - hardware ACK)"));
@@ -1290,8 +1304,10 @@ void processCommand(const char *cmd) {
             sendControlPacket(PKT_DISC);
             state = S_IDLE;
             openListenPipes();
+            sendNoCarrier();   // dropped active connection
+            return;
         }
-        sendOK();
+        sendOK();   // was already idle or just rejected a ring
         return;
     }
 
