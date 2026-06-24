@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.20.0"
+#define MODEM_VERSION "v1.22.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -220,8 +220,9 @@ char     lastDialStr[DIAL_STR_LEN + 5]; // "ATD XXYYZZ" copy for retransmission
 
 // Incoming call state (used while S_RINGING)
 uint8_t  pendingMac[3]  = {0, 0, 0};  // MAC of the caller waiting to be answered
-uint8_t  ringCount      = 0;           // how many RING responses sent so far
-unsigned long ringTimer = 0;           // millis() of next RING output
+uint8_t  ringCount       = 0;          // how many RING responses sent so far
+unsigned long ringTimer  = 0;          // millis() of next RING output
+unsigned long lastConnMs = 0;          // millis() of last PKT_CONN received (ring timeout)
 
 // Circular buffers
 uint8_t rxBuf[RX_BUF_SIZE];
@@ -660,24 +661,29 @@ void flushTxBuffer() {
         if (!sendPacket(PKT_DATA, chunk, n)) {
             break;
         }
-        // Brief RX window after each data packet: stay in listen mode for
-        // SW_ACK_WAIT_MS so the remote's SWACK can arrive before we TX again.
-        // IMPORTANT: do NOT call handleRadioPacket() here — doing so re-entrantly
-        // modifies dataTxSeq, swWinHead and window slots while we're mid-loop,
-        // causing corruption on long sessions. Instead just drain the RX FIFO
-        // into the pending packet slot; the main loop processes it next iteration.
+        // Brief RX window after each data packet so the remote's SWACK can
+        // arrive before we TX again. Process SWACK/NACK immediately (safe —
+        // they only update window state, no re-entrant sendPacket calls).
+        // Defer PKT_DATA to pendingPkt so swflowAckData() runs in main loop
+        // context, not re-entrantly inside our TX loop.
         if (flowMode == 2) {
             unsigned long waitUntil = millis() + SW_ACK_WAIT_MS;
             while (millis() < waitUntil) {
                 if (radio.available()) {
-                    // Read directly into rxBuf so main loop can process it safely.
                     uint8_t tmpPkt[PAYLOAD_SIZE];
                     radio.read(tmpPkt, PAYLOAD_SIZE);
-                    // Only buffer SWACK/SWACK_YIELD/NACK — push rest to pending.
-                    // For simplicity, just store in a one-slot pending buffer.
-                    if (!pendingPktReady) {
-                        memcpy(pendingPkt, tmpPkt, PAYLOAD_SIZE);
-                        pendingPktReady = true;
+                    uint8_t ptype = tmpPkt[0];
+                    if (ptype == PKT_SWACK || ptype == PKT_SWACK_YIELD ||
+                        ptype == PKT_NACK  || ptype == PKT_XON ||
+                        ptype == PKT_XOFF) {
+                        // Safe to process immediately — no re-entrant TX
+                        handleRadioPacket(tmpPkt);
+                    } else {
+                        // PKT_DATA or other — defer to main loop
+                        if (!pendingPktReady) {
+                            memcpy(pendingPkt, tmpPkt, PAYLOAD_SIZE);
+                            pendingPktReady = true;
+                        }
                     }
                     break;
                 }
@@ -744,6 +750,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 } else {
                     memset(pendingMac, 0, 3);
                 }
+                lastConnMs = millis();   // refresh ring timeout on every PKT_CONN
                 if (state == S_IDLE) {
                     // Fresh call — reset ring cadence
                     ringCount = 0;
@@ -960,6 +967,7 @@ void factoryReset() {
     dialRetryCount = 0;
     dialRetrying   = false;
     autoDial       = false;
+    lastConnMs     = 0;
     memset(lastDialStr, 0, sizeof(lastDialStr));
     kaInitiator    = false;
     kaMissed       = 0;
@@ -1267,6 +1275,9 @@ void processCommand(const char *cmd) {
             memcpy(remoteMac, pendingMac, 3);
             sendControlPacket(PKT_DISC);
             memset(remoteMac, 0, 3);
+            ringCount  = 0;
+            ringTimer  = 0;
+            lastConnMs = 0;
             state = S_IDLE;
             openListenPipes();
         } else if (state == S_DATA || state == S_CONNECTED || state == S_CONNECTING) {
@@ -1876,7 +1887,24 @@ void loop() {
     // ── 8. Flow control check ────────────────────────────────────────────────
     checkFlowControl();
 
-    // ── 9. Ring cadence and auto-answer ────────────────────────────────────
+    // ── 9. Ring cadence, auto-answer, and ring timeout ───────────────────────
+    // Ring timeout: if no PKT_CONN received for longer than the caller's full
+    // retry window, the caller has gone — stop ringing and return to IDLE.
+    // Window = (S8+1) attempts × S7 s each + S8 gaps × S9 s + 2 s margin.
+    if (state == S_RINGING && lastConnMs != 0) {
+        unsigned long ringTimeoutMs =
+            (unsigned long)(regS8 + 1) * (unsigned long)regS7 * 1000UL
+            + (unsigned long)regS8     * (unsigned long)regS9 * 1000UL
+            + 2000UL;
+        if (millis() - lastConnMs > ringTimeoutMs) {
+            state      = S_IDLE;
+            ringCount  = 0;
+            ringTimer  = 0;
+            lastConnMs = 0;
+            openListenPipes();
+            cliPrintln(F("NO ANSWER"));
+        }
+    }
     if (state == S_RINGING && (ringTimer == 0 || now >= ringTimer)) {
         ringCount++;
         sendRing();
