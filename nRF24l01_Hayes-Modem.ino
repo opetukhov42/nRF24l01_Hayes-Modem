@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.18.0"
+#define MODEM_VERSION "v1.20.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -199,6 +199,8 @@ uint8_t regS15       = 50;    // S15: channel scan duration in ms (default 50)
 uint8_t regS16       = 5;     // S16: transparent mode TX idle flush ms (default 5)
 uint8_t regS17       = 20;    // S17: spectrum scan dwell ms per channel (default 20)
 
+unsigned long lastDisconnectMs = 0;  // millis() of last disconnect — busy detect grace period
+
 // Data-loss counters (reset by ATI or AT&F)
 uint32_t txDropped   = 0;    // bytes dropped: serial→radio direction (host sent too fast)
 uint32_t rxDropped   = 0;    // bytes dropped: radio→serial direction (radio came in too fast)
@@ -237,6 +239,11 @@ bool hostXoffSent  = false;   // we told the host to stop
 bool radioXoffRecv  = false;  // remote told us to stop
 bool radioXoffSent  = false;  // we told remote to stop
 bool yieldToRemote  = false;  // remote sent SWACK_YIELD — pause our TX, let them send
+
+// Pending packet: flushTxBuffer's RX wait stores here to avoid re-entrant
+// handleRadioPacket() calls. Main loop drains it before radio.available().
+bool    pendingPktReady = false;
+uint8_t pendingPkt[PAYLOAD_SIZE];
 
 // ── LED state ────────────────────────────────────────────────────────────────
 // SD and RD are monostable: they light for LED_FLASH_MS then go dark.
@@ -653,18 +660,26 @@ void flushTxBuffer() {
         if (!sendPacket(PKT_DATA, chunk, n)) {
             break;
         }
-        // Brief RX window: stay in listen mode for SW_ACK_WAIT_MS so the
-        // remote's SWACK has a chance to arrive before we send the next packet.
-        // Without this, back-to-back TX calls keep the radio deaf and SWACKs
-        // are missed, causing the retransmit timer to fire unnecessarily.
+        // Brief RX window after each data packet: stay in listen mode for
+        // SW_ACK_WAIT_MS so the remote's SWACK can arrive before we TX again.
+        // IMPORTANT: do NOT call handleRadioPacket() here — doing so re-entrantly
+        // modifies dataTxSeq, swWinHead and window slots while we're mid-loop,
+        // causing corruption on long sessions. Instead just drain the RX FIFO
+        // into the pending packet slot; the main loop processes it next iteration.
         if (flowMode == 2) {
             unsigned long waitUntil = millis() + SW_ACK_WAIT_MS;
             while (millis() < waitUntil) {
                 if (radio.available()) {
-                    uint8_t pkt[PAYLOAD_SIZE];
-                    radio.read(pkt, PAYLOAD_SIZE);
-                    handleRadioPacket(pkt);
-                    break;   // got something — exit wait early
+                    // Read directly into rxBuf so main loop can process it safely.
+                    uint8_t tmpPkt[PAYLOAD_SIZE];
+                    radio.read(tmpPkt, PAYLOAD_SIZE);
+                    // Only buffer SWACK/SWACK_YIELD/NACK — push rest to pending.
+                    // For simplicity, just store in a one-slot pending buffer.
+                    if (!pendingPktReady) {
+                        memcpy(pendingPkt, tmpPkt, PAYLOAD_SIZE);
+                        pendingPktReady = true;
+                    }
+                    break;
                 }
             }
         }
@@ -742,6 +757,7 @@ void handleRadioPacket(const uint8_t *pkt) {
 
         case PKT_DISC:
             if (state == S_DATA || state == S_CONNECTED) {
+                lastDisconnectMs = millis();
                 clearBuffers();
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                 swAckValid    = false;
@@ -1065,25 +1081,38 @@ scan_done:
 }
 
 // ── Channel busy detection ─────────────────────────────────────────────────────
-// Listens on the current channel for regS15 milliseconds, sampling the RPD
-// (Received Power Detector) register once per millisecond. The RPD asserts
-// when received signal strength exceeds -64 dBm — enough to catch any active
-// nRF24L01 link on the same channel (data, ACKs, keep-alive pings, all count).
+// Takes N independent RPD samples on the current channel, each with a fresh
+// startListening() call to reset the latch between samples.
+// The RPD latch asserts when signal > -64 dBm and stays set until the next
+// startListening(). Each sample is therefore a clean independent measurement.
 // Returns true if the channel appears occupied, false if clear.
+//
+// Sample count = regS15 / 2 (each sample takes ~2 ms: 1.8 ms settle + read).
+// With regS15=50 (default): 25 samples. Threshold: at least 2 hits required,
+// preventing single-sample glitches from causing a false BUSY.
 bool channelIsBusy() {
-    radio.startListening();
-    unsigned long start = millis();
-    uint8_t hits = 0;
-    uint8_t samples = 0;
-    while (millis() - start < (unsigned long)regS15) {
-        if (radio.testRPD()) hits++;
-        samples++;
-        delay(1);
+    // Grace period: skip busy detect for 200 ms after a disconnect so our own
+    // PKT_DISC and the remote's lingering packets don't cause false BUSY.
+    if (millis() - lastDisconnectMs < 200UL) {
+        return false;
     }
-    openListenPipes();   // restore normal pipe config
-    // Busy if RPD fired on more than 20% of samples — reduces false positives
-    // from brief noise while still catching sustained link traffic.
-    return (hits > 0 && (hits * 100 / samples) >= 20);
+
+    uint8_t samples = regS15 / 2;   // e.g. 25 samples at default S15=50
+    if (samples < 3) samples = 3;   // minimum 3 for a meaningful result
+
+    uint8_t hits = 0;
+    for (uint8_t i = 0; i < samples; i++) {
+        // startListening() resets the RPD latch — each call is a fresh reading.
+        radio.startListening();
+        delayMicroseconds(1800);     // datasheet: ~170 µs min; 1800 µs is safe
+        if (radio.testRPD()) hits++;
+    }
+
+    openListenPipes();
+
+    // Require at least 2 hits to declare busy — prevents single noise spikes
+    // from blocking a dial attempt on what is actually a clear channel.
+    return (hits >= 2);
 }
 
 // ── Command parser ────────────────────────────────────────────────────────────
@@ -1213,6 +1242,8 @@ void processCommand(const char *cmd) {
 
     // ── ATH ─────────────────────────────────────────────────────────────────
     if (strcmp(uc, "ATH") == 0 || strcmp(uc, "ATH0") == 0) {
+        lastDisconnectMs = millis();
+        pendingPktReady  = false;
         // Clear SWFLOW window, buffers, and cancel any pending retry on hangup.
         clearBuffers();
         transBufLen = 0;
@@ -1797,6 +1828,20 @@ void loop() {
     }
 
     // ── 5. Receive radio packets ─────────────────────────────────────────────
+    // Drain pending packet from flushTxBuffer RX wait (avoids re-entrancy).
+    if (pendingPktReady) {
+        pendingPktReady = false;
+        if (flowMode == 0 && (state == S_DATA || state == S_CONNECTED)) {
+            ledFlashRD();
+            for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
+                if (regS13 == 1 && (pendingPkt[i] == 0x11 || pendingPkt[i] == 0x13)) continue;
+                if (!rxPush(pendingPkt[i])) { rxDropped++; ledFlashER(); }
+            }
+            checkFlowControl();
+        } else {
+            handleRadioPacket(pendingPkt);
+        }
+    }
     if (radio.available()) {
         uint8_t pkt[PAYLOAD_SIZE];
         radio.read(pkt, PAYLOAD_SIZE);
@@ -1857,6 +1902,7 @@ void loop() {
                 cliPrintln(regS12);
                 ledFlashER();
                 if (kaMissed >= regS12) {
+                    lastDisconnectMs = millis();
                     clearBuffers();
                     for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                     swAckValid    = false;
@@ -1895,6 +1941,7 @@ void loop() {
             if (millis() - kaLastPingMs > windowMs) {
                 cliPrintln(F("KA timeout - no pings received"));
                 ledFlashER();
+                lastDisconnectMs = millis();
                 clearBuffers();
                 for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
                 swAckValid   = false;
