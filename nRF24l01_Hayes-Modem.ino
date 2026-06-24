@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.22.0"
+#define MODEM_VERSION "v1.24.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -530,8 +530,9 @@ inline bool txPush(uint8_t b) {
 }
 inline int txPop() {
     if (txHead == txTail) return -1;
-    return txBuf[txTail++];
-    txTail %= TX_BUF_SIZE;
+    uint8_t b = txBuf[txTail];
+    txTail = (txTail + 1) % TX_BUF_SIZE;   // wrap BEFORE return — was dead code!
+    return b;
 }
 
 // ── Buffer flush ─────────────────────────────────────────────────────────────
@@ -787,6 +788,10 @@ void handleRadioPacket(const uint8_t *pkt) {
 
         case PKT_XON:
             radioXoffRecv = false;
+            // Reset retransmit timers so slots don't immediately fire
+            // after the pause — they were paused, not lost.
+            for (uint8_t i = 0; i < SW_WIN_SIZE; i++)
+                if (swWin[i].used) swWin[i].sentMs = millis();
             break;
 
         case PKT_XOFF:
@@ -1992,14 +1997,15 @@ void loop() {
     }
 
         // ── 11. SWFLOW: retransmit timed-out window slots ────────────────────────
-    if (flowMode == 2 && (state == S_DATA || state == S_CONNECTED)) {
+    if (flowMode == 2 && (state == S_DATA || state == S_CONNECTED)
+        && !radioXoffRecv) {   // don't retransmit while remote says stop
         for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
             if (swWin[i].used && (millis() - swWin[i].sentMs) >= SW_RETX_MS) {
                 openWritePipe(remoteMac);
                 bool ok = radio.write(swWin[i].pkt, PAYLOAD_SIZE);
                 if (ok) ledFlashSD(); else ledFlashER();
                 openListenPipes();
-                swWin[i].sentMs = millis();  // fresh timestamp, not stale now
+                swWin[i].sentMs = millis();
             }
         }
     }
