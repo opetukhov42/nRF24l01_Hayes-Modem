@@ -44,9 +44,9 @@
  *   ATSn=value       – set S-register n to value (all saved to EEPROM):
  *                      S0  auto-answer rings (0=off)
  *                      S6  pre-dial wait seconds (default 0, radio needs no dialtone)
- *                      S7  carrier wait / connect timeout seconds (default 1, radio ACK is near-instant)
+ *                      S7  carrier wait / connect timeout seconds (default 3)
  *                      S8  dial retry attempts after failure (default 3, 0=no retry)
- *                      S9  inter-retry interval seconds (default 10)
+ *                      S9  inter-retry interval seconds (default 3)
  *                      S10 keep-alive enable (1=on default, 0=off)
  *                      S11 keep-alive interval seconds (default 5)
  *                      S12 missed pongs before drop (default 3)
@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.14.0"
+#define MODEM_VERSION "v1.18.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -187,9 +187,9 @@ uint8_t speedEnum    = 1;   // 0=250k 1=1M 2=2M
 bool    echoOn       = true;
 uint8_t regS0        = 0;     // S0 register: 0=manual answer, 1+=auto-answer after n rings
 uint8_t regS6        = 0;     // S6: seconds to wait before first dial attempt (0=none, radio needs no dialtone)
-uint8_t regS7        = 1;     // S7: seconds to wait for carrier (1 s, radio ACK is near-instant)
-uint8_t regS8        = 3;     // S8: number of retry attempts after first failure
-uint8_t regS9        = 10;    // S9: seconds between retry attempts
+uint8_t regS7        = 3;     // S7: seconds to wait for carrier (default 3)
+uint8_t regS8        = 3;     // S8: number of retry attempts after first failure (default 3)
+uint8_t regS9        = 3;     // S9: seconds between retry attempts (default 3)
 uint8_t regS10       = 1;     // S10: keep-alive enable (1=on, 0=off)
 uint8_t regS11       = 5;     // S11: keep-alive interval (seconds)
 uint8_t regS12       = 3;     // S12: missed pongs before dropping connection
@@ -297,7 +297,7 @@ struct SwSlot {
     bool     used;
 };
 SwSlot   swWin[SW_WIN_SIZE];
-uint8_t  swWinHead = 0;           // next slot to fill
+uint8_t  swWinHead = 0;           // next slot to try (0-3, always kept in range)
 uint8_t  swAckedSeq = 0;    // TX side: last dataTxSeq the remote confirmed via SWACK
 bool     swAckValid = false;    // TX side: have we received any SWACK yet?
 uint8_t  rxAckedSeq = 0;    // RX side: last incoming data seq we ACKed
@@ -411,9 +411,9 @@ void loadConfig() {
     }
     startupSlot = EEPROM.read(EE_STARTUP);
     regS6 = EEPROM.read(EE_S6); if (regS6 == 0xFF) regS6 = 0;
-    regS7 = EEPROM.read(EE_S7); if (regS7 == 0xFF) regS7 = 1;
+    regS7 = EEPROM.read(EE_S7); if (regS7 == 0xFF) regS7 = 3;
     regS8 = EEPROM.read(EE_S8); if (regS8 == 0xFF) regS8 = 3;
-    regS9  = EEPROM.read(EE_S9);  if (regS9  == 0xFF) regS9  = 10;
+    regS9  = EEPROM.read(EE_S9);  if (regS9  == 0xFF) regS9  = 3;
     regS10 = EEPROM.read(EE_S10); if (regS10 == 0xFF) regS10 = 1;
     regS11 = EEPROM.read(EE_S11); if (regS11 == 0xFF) regS11 = 5;
     regS12 = EEPROM.read(EE_S12); if (regS12 == 0xFF) regS12 = 3;
@@ -553,11 +553,11 @@ int8_t readRSSI() {
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
-void sendOK()     { Serial.println(F("OK")); }
-void sendError()  { Serial.println(F("ERROR")); }
-void sendNoCarrier() { Serial.println(F("NO CARRIER")); ledFlashER(); }
-void sendConnect()   { Serial.println(F("CONNECT")); }
-void sendRing()      { Serial.println(F("RING")); }
+void sendOK()        { Serial.print(F("\r\nOK\r\n")); }
+void sendError()     { Serial.print(F("\r\nERROR\r\n")); }
+void sendNoCarrier() { Serial.print(F("\r\nNO CARRIER\r\n")); ledFlashER(); }
+void sendConnect()   { Serial.print(F("\r\nCONNECT\r\n")); }
+void sendRing()      { Serial.print(F("\r\nRING\r\n")); }
 
 // Print diagnostic/unsolicited text only when in CLI mode (not raw data mode).
 // In S_DATA the serial stream is raw — injecting text corrupts it.
@@ -585,12 +585,26 @@ bool sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
     // polluted by interleaved control packets (PING, PONG, SWACK etc.).
     if (flowMode == 2 && type == PKT_DATA) {
         pkt[1] = dataTxSeq;          // overwrite with data-only seq
-        uint8_t slotIdx = swWinHead % SW_WIN_SIZE;
+        // Find the next free window slot (linear scan, SW_WIN_SIZE=4 so cheap).
+        // This is safer than modulo-indexing which can overwrite unACKed packets
+        // when swWinHead wraps around on long sessions.
+        uint8_t slotIdx = 0xFF;
+        for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
+            uint8_t candidate = (swWinHead + i) % SW_WIN_SIZE;
+            if (!swWin[candidate].used) { slotIdx = candidate; break; }
+        }
+        if (slotIdx == 0xFF) {
+            // All slots occupied — this shouldn't happen because flushTxBuffer
+            // checks inFlight < SW_WIN_SIZE before calling sendPacket, but
+            // guard here anyway to prevent corruption.
+            openListenPipes();
+            return false;
+        }
         memcpy(swWin[slotIdx].pkt, pkt, PAYLOAD_SIZE);
         swWin[slotIdx].sentMs = millis();
         swWin[slotIdx].used   = true;
         dataTxSeq++;
-        swWinHead++;
+        swWinHead = (swWinHead + 1) % SW_WIN_SIZE;  // keep in 0-3 range
     }
 
     openWritePipe(remoteMac);
@@ -705,9 +719,9 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_CONN:
-            // Incoming connection request
-            if (state == S_IDLE) {
-                // Store caller MAC from packet payload.
+            // Incoming connection request — accept from IDLE or refresh if
+            // already ringing (initiator may retransmit PKT_CONN after S7 timeout).
+            if (state == S_IDLE || state == S_RINGING) {
                 if (len >= 3) {
                     pendingMac[0] = pkt[DATA_OFFSET];
                     pendingMac[1] = pkt[DATA_OFFSET + 1];
@@ -715,10 +729,14 @@ void handleRadioPacket(const uint8_t *pkt) {
                 } else {
                     memset(pendingMac, 0, 3);
                 }
-                ringCount = 0;
-                ringTimer = 0;        // fire first RING immediately next loop
-                state     = S_RINGING;
-                // Auto-answer will be checked in loop(); ATA handles manual answer.
+                if (state == S_IDLE) {
+                    // Fresh call — reset ring cadence
+                    ringCount = 0;
+                    ringTimer = 0;    // fire first RING immediately
+                }
+                // If already S_RINGING: keep ringing, just refresh pendingMac.
+                // Do NOT reset ringCount — avoids re-triggering auto-answer delay.
+                state = S_RINGING;
             }
             break;
 
@@ -753,15 +771,21 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_ACK:
-            // handshake ack during ATD
-            if (state == S_CONNECTING) {
-                clearBuffers();         // discard stale pre-connect data
-                state         = S_DATA;
-                kaInitiator   = true;   // we dialled — we own keep-alive
+            // Handshake ACK — accept during active dial (S_CONNECTING) OR
+            // during the inter-retry wait (S_IDLE with dialRetrying=true).
+            // The second case handles manual ATA on the receiver while the
+            // initiator is pausing between S8 retry attempts.
+            if (state == S_CONNECTING ||
+                (state == S_IDLE && dialRetrying && lastDialStr[0] != '\0')) {
+                dialRetrying   = false;   // cancel any pending retry
+                dialRetryCount = 0;
+                clearBuffers();
+                kaInitiator   = true;
                 kaMissed      = 0;
                 kaWaitingPong = false;
                 kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
-                sendConnect();
+                sendConnect();           // print while still in CLI mode
+                state         = S_DATA;  // switch AFTER printing CONNECT
             }
             break;
 
@@ -865,13 +889,13 @@ void doAnswer() {
     saveConfig();                  // persist new remote MAC
     clearBuffers();                // discard any stale pre-connect data
     sendConnectAck();
-    state         = S_DATA;
     kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
     kaMissed      = 0;
     kaWaitingPong = false;
     kaPingAt      = 0;      // answerer never initiates pings
     kaLastPingMs  = millis(); // arm watchdog from connect time
-    sendConnect();
+    sendConnect();           // print while still in CLI mode
+    state         = S_DATA;  // switch to data mode AFTER printing CONNECT
 }
 
 void sendConnectAck() {
@@ -894,9 +918,9 @@ void factoryReset() {
     // S-registers
     regS0 = 0;
     regS6 = 0;
-    regS7 = 1;
+    regS7 = 3;
     regS8  = 3;
-    regS9  = 10;
+    regS9  = 3;
     regS10 = 1;
     regS11 = 5;
     regS12 = 3;
@@ -969,7 +993,7 @@ void factoryReset() {
 
 void spectrumScan() {
     if (state != S_IDLE && state != S_CONNECTED) {
-        Serial.println(F("ERROR: disconnect first"));
+        Serial.print(F("\r\nERROR: disconnect first\r\n"));
         return;
     }
 
@@ -1099,7 +1123,7 @@ void processCommand(const char *cmd) {
 
     // ── ATI ─────────────────────────────────────────────────────────────────
     if (strcmp(uc, "ATI") == 0) {
-        Serial.print(F("nRF24L01 AT Modem "));
+        Serial.print(F("\r\nnRF24L01 AT Modem "));
         Serial.println(F(MODEM_VERSION));
 
         // Radio hardware status — re-check live so ATI always reflects reality.
@@ -1315,7 +1339,7 @@ void processCommand(const char *cmd) {
             // S14: busy detect — scan channel before dialling.
             if (regS14 == 1) {
                 if (channelIsBusy()) {
-                    Serial.println(F("BUSY"));
+                    Serial.print(F("\r\nBUSY\r\n"));
                     ledFlashER();
                     return;
                 }
@@ -1520,7 +1544,7 @@ void processCommand(const char *cmd) {
     // ── AT&F — factory reset ────────────────────────────────────────────────
     if (strcmp(uc, "AT&F") == 0) {
         factoryReset();
-        Serial.println(F("Factory reset complete."));
+        Serial.print(F("\r\nFactory reset complete.\r\n"));
         sendOK();
         return;
     }
@@ -1638,7 +1662,7 @@ void setup() {
     applyRadioConfig();
     openListenPipes();
 
-    Serial.print(F("nRF24L01 AT Modem "));
+    Serial.print(F("\r\nnRF24L01 AT Modem "));
     Serial.print(F(MODEM_VERSION));
     Serial.println(F(" ready."));
     Serial.println(F("Type ATI for status."));
@@ -1646,7 +1670,7 @@ void setup() {
     if (startupSlot < DIAL_SLOTS && dialStr[startupSlot][0] != '\0') {
         autoDial   = true;
         autoDialMs = millis() + 2000;
-        Serial.print(F("Autodial: slot "));
+        Serial.print(F("\r\nAutodial: slot "));
         Serial.print(startupSlot);
         Serial.print(F(" -> "));
         Serial.println(dialStr[startupSlot]);
