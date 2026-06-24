@@ -103,7 +103,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.50.0"
+#define MODEM_VERSION "v1.52.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -733,7 +733,8 @@ void handleRadioPacket(const uint8_t *pkt) {
 
     switch (type) {
         case PKT_DATA:
-            if (state == S_DATA || state == S_CONNECTED) {
+            if (state == S_DATA) {
+                // Data mode: accept and buffer received bytes
                 ledFlashRD();
                 if (swflowAckData(pkt[1])) {
                     for (uint8_t i = 0; i < len && i < MAX_DATA; i++) {
@@ -741,6 +742,10 @@ void handleRadioPacket(const uint8_t *pkt) {
                     }
                     checkFlowControl();
                 }
+            } else if (state == S_CONNECTED) {
+                // CLI mode: remote may still be sending — ACK to keep
+                // stop-and-wait flowing but discard data (not in data mode).
+                swflowAckData(pkt[1]);
             }
             break;
 
@@ -1270,8 +1275,9 @@ tx_done:
         Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
         Serial.print(F("  drop="));    Serial.println(txDropped - dropStart);
     }
-    // Reset KA timers so keep-alive resumes cleanly without
-    // false timeout from the time spent in the test loop.
+    pendingPktReady = false;
+    testStopFlag    = false;
+    // Reset KA timers so keep-alive resumes cleanly.
     kaPingAt     = millis() + (unsigned long)regS11 * 1000UL;
     kaLastPingMs = millis();
     kaMissed     = 0;
@@ -1435,6 +1441,8 @@ rx_done:
     } else {
         Serial.print(F("\r\n[RX] no test stream received\r\n"));
     }
+    pendingPktReady = false;
+    clearBuffers();
     // Reset KA timers so keep-alive resumes cleanly.
     kaPingAt     = millis() + (unsigned long)regS11 * 1000UL;
     kaLastPingMs = millis();
