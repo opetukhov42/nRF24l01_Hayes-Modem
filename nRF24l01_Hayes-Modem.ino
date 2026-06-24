@@ -96,7 +96,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.36.0"
+#define MODEM_VERSION "v1.38.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -239,7 +239,7 @@ uint8_t cmdLen = 0;
 bool hostXoffSent  = false;   // we told the host to stop
 bool radioXoffRecv  = false;  // remote told us to stop
 bool radioXoffSent  = false;  // we told remote to stop
-bool yieldToRemote  = false;  // remote sent SWACK_YIELD — pause our TX, let them send
+bool    yieldToRemote  = false;  // remote sent SWACK_YIELD — pause our TX, let them send
 
 // Pending packet: flushTxBuffer's RX wait stores here to avoid re-entrant
 // handleRadioPacket() calls. Main loop drains it before radio.available().
@@ -259,7 +259,97 @@ unsigned long lastSerialMs = 0;
 
 // Sequence numbers
 uint8_t txSeq     = 0;    // sequence counter for ALL outbound packets
-uint8_t dataTxSeq = 0;    // sequence counter for PKT_DATA only (SWFLOW window)
+
+// Flow / ACK mode: 0=none (reserved), 1=HWACK (hardware ACK), 2=SWFLOW (software flow control, default)
+uint8_t flowMode = 2;
+
+// ── Transparent mode (flowMode == 0) TX buffer ───────────────────────────────
+// Bytes accumulate here until the buffer is full (32 bytes) or the idle timer
+// fires (~5 ms after last byte), then the whole buffer is sent as a raw payload.
+uint8_t  transBuf[PAYLOAD_SIZE];
+uint8_t  transBufLen    = 0;
+unsigned long transLastByteMs = 0;   // millis() of last byte pushed to transBuf
+// TRANS_IDLE_MS replaced by S16 register (regS16) — see ATSn handler
+
+// Baud rate table — index stored in EEPROM, not the raw value (saves 2 bytes).
+// Valid indices 0-7 matching baudTable[]. Default index 4 = 115200.
+const uint32_t baudTable[] = {
+    9600UL, 19200UL, 38400UL, 57600UL,
+    115200UL, 250000UL, 500000UL, 1000000UL
+};
+const uint8_t  BAUD_TABLE_SIZE = 8;
+const uint8_t  BAUD_DEFAULT    = 4;   // 115200
+uint8_t        baudIdx         = BAUD_DEFAULT;
+// Dial string profiles and startup autodial
+char    dialStr[DIAL_SLOTS][DIAL_STR_LEN + 1];  // "" = empty slot
+uint8_t startupSlot = 0xFF;                      // 0xFF = autodial disabled
+bool    autoDial    = false;   // armed in setup() if startup slot is valid + non-empty
+unsigned long autoDialMs = 0;  // millis() timestamp to fire autodial
+
+// ── SWFLOW simple stop-and-wait ───────────────────────────────────────────────
+// Sends one PKT_DATA, waits SW_ACK_WAIT_MS for a SWACK, retries up to
+// SW_RETX_MAX times. No window, no NACK, no gap detection.
+// Yield token embedded in SWACK — receiver sends PKT_SWACK_YIELD when it has
+// data queued, giving itself a transmission window.
+#define SW_ACK_WAIT_MS   5   // ms to wait for SWACK after sending each packet
+#define SW_RETX_MAX      4   // max retransmit attempts before dropping packet
+
+uint8_t swLastPkt[PAYLOAD_SIZE];  // last sent PKT_DATA for retransmit
+bool    swLastPktValid = false;   // true when swLastPkt holds a valid packet
+
+// Keep-alive runtime state
+bool          kaInitiator   = false; // true = we dialled (send pings); false = we answered (reply only)
+unsigned long kaPingAt      = 0;     // millis() when next PKT_PING is due
+uint8_t       kaMissed      = 0;     // consecutive unanswered pings (initiator only)
+bool          kaWaitingPong = false; // true between sending PING and receiving PONG
+unsigned long kaLastPingMs  = 0;     // answerer: millis() of last received PKT_PING (0=none yet)
+
+// Dial retry state (managed by the connect-timeout block in loop())
+uint8_t  dialRetryCount  = 0;          // retries fired so far for current dial
+bool     dialRetrying    = false;      // true while waiting between retries
+unsigned long dialRetryAt = 0;         // millis() when next retry fires
+char     lastDialStr[DIAL_STR_LEN + 5]; // "ATD XXYYZZ" copy for retransmission
+
+// Incoming call state (used while S_RINGING)
+uint8_t  pendingMac[3]  = {0, 0, 0};  // MAC of the caller waiting to be answered
+uint8_t  ringCount   = 0;   // how many RINGs sent (for S0 auto-answer threshold)
+unsigned long lastConnMs = 0;  // millis() of last PKT_CONN received (ring timeout)
+
+// Circular buffers
+uint8_t rxBuf[RX_BUF_SIZE];
+uint16_t rxHead = 0, rxTail = 0;
+
+uint8_t txBuf[TX_BUF_SIZE];
+uint16_t txHead = 0, txTail = 0;
+
+// Command line accumulator
+char cmdBuf[CMD_BUF_SIZE];
+uint8_t cmdLen = 0;
+
+// XON/XOFF state
+bool hostXoffSent  = false;   // we told the host to stop
+bool radioXoffRecv  = false;  // remote told us to stop
+bool radioXoffSent  = false;  // we told remote to stop
+bool    yieldToRemote  = false;  // remote sent SWACK_YIELD — pause our TX, let them send
+
+// Pending packet: flushTxBuffer's RX wait stores here to avoid re-entrant
+// handleRadioPacket() calls. Main loop drains it before radio.available().
+bool    pendingPktReady = false;
+uint8_t pendingPkt[PAYLOAD_SIZE];
+
+// ── LED state ────────────────────────────────────────────────────────────────
+// SD and RD are monostable: they light for LED_FLASH_MS then go dark.
+// ER lights for LED_ER_MS on errors.
+// MR, TR, OH, CD, HS are steady-state and updated by updateSteadyLEDs().
+unsigned long ledSdOff  = 0;   // millis() time to extinguish SD
+unsigned long ledRdOff  = 0;   // millis() time to extinguish RD
+unsigned long ledErOff  = 0;   // millis() time to extinguish ER
+
+// TR blinks while there is pending TX data; track last serial activity
+unsigned long lastSerialMs = 0;
+
+// Sequence numbers
+uint8_t txSeq     = 0;    // sequence counter for ALL outbound packets
 
 // Flow / ACK mode: 0=none (reserved), 1=HWACK (hardware ACK), 2=SWFLOW (software flow control, default)
 uint8_t flowMode = 2;
@@ -288,25 +378,7 @@ bool    autoDial    = false;   // armed in setup() if startup slot is valid + no
 unsigned long autoDialMs = 0;  // millis() timestamp to fire autodial
 
 // ── SWFLOW retransmit window ──────────────────────────────────────────────────
-// Holds up to SW_WIN_SIZE unacknowledged outbound packets so we can retransmit
-// on PKT_NACK. Each slot stores the raw 32-byte payload and a send timestamp.
-#define SW_WIN_SIZE   1   // stop-and-wait: one packet in flight at a time
-#define SW_RETX_MS 10000  // retransmit only after 10 s silence — true last resort;
-                               //   primary recovery is NACK-based via SW_ACK_WAIT
-#define SW_ACK_WAIT_MS  5  // ms to stay in RX after sending a data packet,
-                               //   giving the remote time to send its SWACK back
 
-struct SwSlot {
-    uint8_t  pkt[PAYLOAD_SIZE];
-    uint32_t sentMs;
-    bool     used;
-};
-SwSlot   swWin[SW_WIN_SIZE];
-uint8_t  swWinHead = 0;           // next slot to try (0-3, always kept in range)
-uint8_t  swAckedSeq = 0;    // TX side: last dataTxSeq the remote confirmed via SWACK
-bool     swAckValid = false;    // TX side: have we received any SWACK yet?
-uint8_t  rxAckedSeq = 0;    // RX side: last incoming data seq we ACKed
-bool     rxAckValid = false;    // RX side: have we received any PKT_DATA yet?
 
 // Radio health
 bool     radioFailed   = false;  // set on init fail or runtime disconnect
@@ -587,31 +659,10 @@ bool sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
     if (data && pkt[2] > 0)
         memcpy(pkt + DATA_OFFSET, data, pkt[2]);
 
-    // In SWFLOW mode, store DATA packets in the retransmit window.
-    // dataTxSeq is a data-only counter so window seq numbers are not
-    // polluted by interleaved control packets (PING, PONG, SWACK etc.).
+    // In SWFLOW mode, store PKT_DATA for possible retransmit.
     if (flowMode == 2 && type == PKT_DATA) {
-        pkt[1] = dataTxSeq;          // overwrite with data-only seq
-        // Find the next free window slot (linear scan, SW_WIN_SIZE=4 so cheap).
-        // This is safer than modulo-indexing which can overwrite unACKed packets
-        // when swWinHead wraps around on long sessions.
-        uint8_t slotIdx = 0xFF;
-        for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
-            uint8_t candidate = (swWinHead + i) % SW_WIN_SIZE;
-            if (!swWin[candidate].used) { slotIdx = candidate; break; }
-        }
-        if (slotIdx == 0xFF) {
-            // All slots occupied — this shouldn't happen because flushTxBuffer
-            // checks inFlight < SW_WIN_SIZE before calling sendPacket, but
-            // guard here anyway to prevent corruption.
-            openListenPipes();
-            return false;
-        }
-        memcpy(swWin[slotIdx].pkt, pkt, PAYLOAD_SIZE);
-        swWin[slotIdx].sentMs = millis();
-        swWin[slotIdx].used   = true;
-        dataTxSeq++;
-        swWinHead = (swWinHead + 1) % SW_WIN_SIZE;  // keep in 0-3 range
+        memcpy(swLastPkt, pkt, PAYLOAD_SIZE);
+        swLastPktValid = true;
     }
 
     openWritePipe(remoteMac);
@@ -626,89 +677,83 @@ bool sendControlPacket(uint8_t type) {
 }
 
 // ── Send buffered TX data over the air ───────────────────────────────────────
+// SWFLOW: pure stop-and-wait. Send one packet, wait SW_ACK_WAIT_MS for SWACK.
+// Retransmit up to SW_RETX_MAX times on no-reply.
+// Yield: PKT_SWACK_YIELD from receiver → wait for their packet, then return.
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
-    if (radioXoffRecv) return;   // remote asked us to pause
+    if (radioXoffRecv) return;
 
-    // Cooperative duplex (SWFLOW only): remote sent SWACK_YIELD meaning it has
-    // data queued for us. Actively wait for the remote's packet to arrive so
-    // it gets a real uncontested TX window, not just one skipped loop iteration
-    // (which would be immediately re-entered if our TX buffer is still full).
-    // In HWACK/none mode yieldToRemote is never set so this is never taken.
+    // Cooperative yield: remote requested TX window.
     if (yieldToRemote) {
         yieldToRemote = false;
-        // Wait up to 2×SW_ACK_WAIT_MS for the remote's data packet.
-        // Process it immediately so our next SWACK carries accurate yield flag.
-        unsigned long yieldUntil = millis() + SW_ACK_WAIT_MS * 2;
-        while (millis() < yieldUntil) {
+        unsigned long yieldEnd = millis() + SW_ACK_WAIT_MS * 2;
+        while (millis() < yieldEnd) {
             if (radio.available()) {
-                uint8_t tmpPkt[PAYLOAD_SIZE];
-                radio.read(tmpPkt, PAYLOAD_SIZE);
-                uint8_t ptype = tmpPkt[0];
-                if (ptype == PKT_SWACK || ptype == PKT_SWACK_YIELD ||
-                    ptype == PKT_NACK  || ptype == PKT_XON ||
-                    ptype == PKT_XOFF) {
-                    handleRadioPacket(tmpPkt);
-                } else {
-                    if (!pendingPktReady) {
-                        memcpy(pendingPkt, tmpPkt, PAYLOAD_SIZE);
-                        pendingPktReady = true;
-                    }
+                uint8_t tmp[PAYLOAD_SIZE];
+                radio.read(tmp, PAYLOAD_SIZE);
+                uint8_t pt = tmp[0];
+                if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD ||
+                    pt == PKT_XON   || pt == PKT_XOFF) {
+                    handleRadioPacket(tmp);
+                } else if (!pendingPktReady) {
+                    memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
+                    pendingPktReady = true;
                 }
                 break;
             }
         }
-        return;  // always return after yield — let main loop drain pendingPkt first
+        return;
     }
 
-    while (txAvail() > 0) {
-        // In SWFLOW mode, stop sending new packets when the window is full.
-        if (flowMode == 2) {
-            uint8_t inFlight = 0;
-            for (uint8_t i = 0; i < SW_WIN_SIZE; i++)
-                if (swWin[i].used) inFlight++;
-            if (inFlight >= SW_WIN_SIZE) break;
-        }
+    if (txAvail() == 0) return;
 
-        uint8_t chunk[MAX_DATA];
-        uint8_t n = 0;
-        while (n < MAX_DATA && txAvail() > 0) {
-            int b = txPop();
-            if (b < 0) break;
-            chunk[n++] = (uint8_t)b;
+    if (flowMode != 2) {
+        // HWACK / transparent: fire and forget all buffered data
+        while (txAvail() > 0) {
+            uint8_t chunk[MAX_DATA]; uint8_t n = 0;
+            while (n < MAX_DATA && txAvail() > 0) { int b = txPop(); if (b<0) break; chunk[n++]=(uint8_t)b; }
+            if (n == 0) break;
+            if (!sendPacket(PKT_DATA, chunk, n)) break;
         }
-        if (n == 0) break;
-        if (!sendPacket(PKT_DATA, chunk, n)) {
-            break;
-        }
-        // Brief RX window after each data packet so the remote's SWACK can
-        // arrive before we TX again. Process SWACK/NACK immediately (safe —
-        // they only update window state, no re-entrant sendPacket calls).
-        // Defer PKT_DATA to pendingPkt so swflowAckData() runs in main loop
-        // context, not re-entrantly inside our TX loop.
-        if (flowMode == 2) {
-            unsigned long waitUntil = millis() + SW_ACK_WAIT_MS;
-            while (millis() < waitUntil) {
-                if (radio.available()) {
-                    uint8_t tmpPkt[PAYLOAD_SIZE];
-                    radio.read(tmpPkt, PAYLOAD_SIZE);
-                    uint8_t ptype = tmpPkt[0];
-                    if (ptype == PKT_SWACK || ptype == PKT_SWACK_YIELD ||
-                        ptype == PKT_NACK  || ptype == PKT_XON ||
-                        ptype == PKT_XOFF) {
-                        // Safe to process immediately — no re-entrant TX
-                        handleRadioPacket(tmpPkt);
-                    } else {
-                        // PKT_DATA or other — defer to main loop
-                        if (!pendingPktReady) {
-                            memcpy(pendingPkt, tmpPkt, PAYLOAD_SIZE);
-                            pendingPktReady = true;
-                        }
-                    }
-                    break;
+        return;
+    }
+
+    // SWFLOW stop-and-wait: build one packet
+    uint8_t chunk[MAX_DATA]; uint8_t n = 0;
+    while (n < MAX_DATA && txAvail() > 0) { int b = txPop(); if (b<0) break; chunk[n++]=(uint8_t)b; }
+    if (n == 0) return;
+
+    bool gotAck = false;
+    for (uint8_t attempt = 0; attempt <= SW_RETX_MAX; attempt++) {
+        if (attempt == 0) {
+            sendPacket(PKT_DATA, chunk, n);   // stores copy in swLastPkt
+        } else if (swLastPktValid) {
+            openWritePipe(remoteMac);
+            radio.write(swLastPkt, PAYLOAD_SIZE);
+            ledFlashSD();
+            openListenPipes();
+        } else break;
+
+        unsigned long waitEnd = millis() + SW_ACK_WAIT_MS;
+        while (millis() < waitEnd) {
+            if (radio.available()) {
+                uint8_t tmp[PAYLOAD_SIZE];
+                radio.read(tmp, PAYLOAD_SIZE);
+                uint8_t pt = tmp[0];
+                if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
+                    handleRadioPacket(tmp);
+                    gotAck = true;
+                } else if (pt == PKT_XON || pt == PKT_XOFF) {
+                    handleRadioPacket(tmp);
+                } else if (!pendingPktReady) {
+                    memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
+                    pendingPktReady = true;
                 }
+                break;
             }
         }
+        if (gotAck) break;
     }
 }
 
@@ -753,9 +798,6 @@ void handleRadioPacket(const uint8_t *pkt) {
         case PKT_DATA:
             if (state == S_DATA || state == S_CONNECTED) {
                 ledFlashRD();
-                // swflowAckData returns false for duplicates and out-of-order
-                // packets — discard the data in those cases to prevent
-                // corruption from retransmits and gap-fill arrivals.
                 if (swflowAckData(pkt[1])) {
                     for (uint8_t i = 0; i < len && i < MAX_DATA; i++) {
                         rxPush(pkt[DATA_OFFSET + i]);
@@ -795,19 +837,14 @@ void handleRadioPacket(const uint8_t *pkt) {
             if (state == S_DATA || state == S_CONNECTED) {
                 lastDisconnectMs = millis();
                 clearBuffers();
-                for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
-                swAckValid    = false;
-                swWinHead     = 0;
-                dataTxSeq     = 0;
-                swAckedSeq    = 0;
-                rxAckValid    = false;
-                rxAckedSeq    = 0;
                 kaInitiator   = false;
                 kaMissed      = 0;
                 kaWaitingPong = false;
                 kaPingAt      = 0;
                 kaLastPingMs  = 0;
                 yieldToRemote  = false;
+                swLastPktValid = false;
+                rxLastSeq      = 0xFF;
                 radioXoffRecv  = false;
                 radioXoffSent  = false;
                 hostXoffSent   = false;
@@ -819,10 +856,6 @@ void handleRadioPacket(const uint8_t *pkt) {
 
         case PKT_XON:
             radioXoffRecv = false;
-            // Reset retransmit timers so slots don't immediately fire
-            // after the pause — they were paused, not lost.
-            for (uint8_t i = 0; i < SW_WIN_SIZE; i++)
-                if (swWin[i].used) swWin[i].sentMs = millis();
             break;
 
         case PKT_XOFF:
@@ -840,11 +873,9 @@ void handleRadioPacket(const uint8_t *pkt) {
                 dialRetryCount = 0;
                 clearBuffers();
                 // Reset all SWFLOW sequence state for the new session.
-                for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
-                swAckValid  = false;  swAckedSeq  = 0;
-                rxAckValid  = false;  rxAckedSeq  = 0;
-                swWinHead   = 0;      dataTxSeq   = 0;
-                yieldToRemote = false;
+                yieldToRemote  = false;
+                swLastPktValid = false;
+                rxLastSeq      = 0xFF;
                 kaInitiator   = true;
                 kaMissed      = 0;
                 kaWaitingPong = false;
@@ -855,20 +886,8 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_NACK:
-            // Remote detected a gap — retransmit the requested seq from our window.
-            if (flowMode == 2 && len >= 1) {
-                uint8_t wantSeq = pkt[DATA_OFFSET];
-                for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
-                    if (swWin[i].used && swWin[i].pkt[1] == wantSeq) {
-                        openWritePipe(remoteMac);
-                        bool ok = radio.write(swWin[i].pkt, PAYLOAD_SIZE);
-                        if (ok) ledFlashSD(); else ledFlashER();
-                        openListenPipes();
-                        swWin[i].sentMs = millis();   // reset retx timer
-                        break;
-                    }
-                }
-            }
+            // NACK not used in stop-and-wait mode; retransmit is handled
+            // by the SW_ACK_WAIT timeout in flushTxBuffer.
             break;
 
         case PKT_PING:
@@ -885,84 +904,51 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_SWACK_YIELD:
-            // Remote ACKs our data AND requests we yield TX — it has data to send.
+            // Remote ACKs our data AND wants a TX window.
             yieldToRemote = true;
-            // Fall through to normal SWACK window-advance logic.
-            /* fall through */
+            // fall through
         case PKT_SWACK:
-            // Cumulative ACK: remote has received everything up to and including seq N.
-            if (flowMode == 2 && len >= 1) {
-                uint8_t ackedSeq = pkt[DATA_OFFSET];
-                swAckedSeq  = ackedSeq;
-                swAckValid  = true;
-                // Free all window slots with seq <= ackedSeq (handles wraparound).
-                for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
-                    if (swWin[i].used) {
-                        uint8_t s = swWin[i].pkt[1];
-                        // Wraparound-safe: distance from ackedSeq back to s.
-                        uint8_t age = (uint8_t)(ackedSeq - s + 256) % 256;
-                        if (age < 128) swWin[i].used = false;  // s <= ackedSeq
-                    }
-                }
-            }
+            // Stop-and-wait: SWACK means our last packet was delivered.
+            // swLastPkt is now stale — clear it.
+            swLastPktValid = false;
             break;
     }
 }
 
-// ── SWFLOW receiver: send SWACK and detect gaps ───────────────────────────────
-// Returns true if the packet data should be accepted into rxBuf, false if it
-// should be discarded (gap/duplicate). Caller must check the return value.
+// ── SWFLOW receiver: send SWACK ─────────────────────────────────────────────
+// Returns true if packet data should be accepted into rxBuf.
+// Sends PKT_SWACK_YIELD if we have data queued (cooperative duplex),
+// otherwise plain PKT_SWACK. No gap detection — stop-and-wait guarantees
+// in-order delivery; duplicates detected by seq == last seen.
 bool swflowAckData(uint8_t seq) {
-    if (flowMode != 2) return true;   // non-SWFLOW: always accept
+    if (flowMode != 2) return true;
 
-    if (rxAckValid) {
-        uint8_t expected = (uint8_t)(rxAckedSeq + 1);
-        if (seq == rxAckedSeq) {
-            // Duplicate — sender retransmitted something we already ACKed.
-            // Re-send SWACK to unblock the sender but discard the data.
-            uint8_t ackPkt[PAYLOAD_SIZE];
-            memset(ackPkt, 0, PAYLOAD_SIZE);
-            bool weHaveData = (txAvail() > 0) && !radioXoffRecv;
-            ackPkt[0] = weHaveData ? PKT_SWACK_YIELD : PKT_SWACK;
-            ackPkt[1] = txSeq++;
-            ackPkt[2] = 1;
-            ackPkt[DATA_OFFSET] = seq;
-            openWritePipe(remoteMac);
-            radio.write(ackPkt, PAYLOAD_SIZE);
-            openListenPipes();
-            return false;   // discard duplicate data
-        }
-        if (seq != expected) {
-            // Gap — request the missing seq, discard this out-of-order packet.
-            uint8_t nackPkt[PAYLOAD_SIZE];
-            memset(nackPkt, 0, PAYLOAD_SIZE);
-            nackPkt[0] = PKT_NACK;
-            nackPkt[1] = txSeq++;
-            nackPkt[2] = 1;
-            nackPkt[DATA_OFFSET] = expected;
-            openWritePipe(remoteMac);
-            radio.write(nackPkt, PAYLOAD_SIZE);
-            openListenPipes();
-            return false;   // discard out-of-order data
-        }
+    // Duplicate detection: if seq matches rxLastSeq (global, reset on connect).
+    if (rxLastSeq != 0xFF && seq == rxLastSeq) {
+        // Re-send SWACK to unblock sender
+        uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
+        bool haveData = (txAvail() > 0) && !radioXoffRecv;
+        ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
+        ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
+        openWritePipe(remoteMac); radio.write(ack, PAYLOAD_SIZE);
+        if (haveData) ledFlashSD(); else ledFlashSD();
+        openListenPipes();
+        return false;   // discard duplicate
     }
-    // In-order: send SWACK. If we also have data pending, use PKT_SWACK_YIELD
-    // to ask the remote to pause its TX — cooperative half-duplex token passing.
-    rxAckedSeq = seq;
-    rxAckValid = true;
-    uint8_t ackPkt[PAYLOAD_SIZE];
-    memset(ackPkt, 0, PAYLOAD_SIZE);
-    bool weHaveData = (txAvail() > 0) && !radioXoffRecv;
-    ackPkt[0] = weHaveData ? PKT_SWACK_YIELD : PKT_SWACK;
-    ackPkt[1] = txSeq++;
-    ackPkt[2] = 1;
-    ackPkt[DATA_OFFSET] = seq;
+    rxLastSeq = seq;
+
+    // In-order: send SWACK (with yield if we have data)
+    uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
+    bool haveData = (txAvail() > 0) && !radioXoffRecv;
+    ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
+    ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
     openWritePipe(remoteMac);
-    bool ok = radio.write(ackPkt, PAYLOAD_SIZE);
+    bool ok = radio.write(ack, PAYLOAD_SIZE);
     if (ok) ledFlashSD(); else ledFlashER();
     openListenPipes();
-    return true;   // in-order packet — caller should accept the data
+    return true;
 }
+
 
 // Complete an incoming call: copy pending MAC, ACK the caller, enter DATA mode.
 void doAnswer() {
@@ -974,11 +960,9 @@ void doAnswer() {
     EEPROM.update(EE_REM_MAC + 2, remoteMac[2]);
     clearBuffers();                // discard any stale pre-connect data
     // Reset all SWFLOW sequence state for the new session.
-    for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
-    swAckValid  = false;  swAckedSeq  = 0;
-    rxAckValid  = false;  rxAckedSeq  = 0;
-    swWinHead   = 0;      dataTxSeq   = 0;
-    yieldToRemote = false;
+    yieldToRemote  = false;
+    swLastPktValid = false;
+    rxLastSeq      = 0xFF;
     sendConnectAck();
     kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
     kaMissed      = 0;
@@ -1043,13 +1027,9 @@ void factoryReset() {
     kaPingAt       = 0;
     kaLastPingMs   = 0;
     yieldToRemote  = false;
+    swLastPktValid = false;
+    rxLastSeq      = 0xFF;
     clearBuffers();
-    dataTxSeq      = 0;
-    swWinHead      = 0;
-    swAckedSeq     = 0;
-    swAckValid     = false;
-    rxAckedSeq     = 0;
-    rxAckValid     = false;
 
     // Persist — saveConfig() writes magic byte last
     saveConfig();
@@ -1357,13 +1337,6 @@ void processCommand(const char *cmd) {
         // Clear SWFLOW window, buffers, and cancel any pending retry on hangup.
         clearBuffers();
         transBufLen = 0;
-        for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
-        swAckValid     = false;
-        swWinHead      = 0;
-        dataTxSeq      = 0;
-        swAckedSeq     = 0;
-        rxAckValid     = false;
-        rxAckedSeq     = 0;
         dialRetrying   = false;
         dialRetryCount = 0;
         kaInitiator    = false;
@@ -1372,6 +1345,8 @@ void processCommand(const char *cmd) {
         kaPingAt       = 0;
         kaLastPingMs   = 0;
         yieldToRemote  = false;
+        swLastPktValid = false;
+        rxLastSeq      = 0xFF;
         if (state == S_RINGING) {
             // Reject incoming call — send DISC back to caller using pending MAC.
             memcpy(remoteMac, pendingMac, 3);
@@ -1681,8 +1656,6 @@ void processCommand(const char *cmd) {
         if (val >= 0 && val <= 2) {
             flowMode = (uint8_t)val;
             // Clear SWFLOW window when switching modes.
-            for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
-            swAckValid = false;
             saveConfig();
             applyRadioConfig();
             sendOK();
@@ -2030,13 +2003,6 @@ void loop() {
                 if (kaMissed >= regS12) {
                     lastDisconnectMs = millis();
                     clearBuffers();
-                    for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
-                    swAckValid    = false;
-                    swWinHead     = 0;
-                    dataTxSeq     = 0;
-                    swAckedSeq    = 0;
-                    rxAckValid    = false;
-                    rxAckedSeq    = 0;
                     kaMissed      = 0;
                     kaWaitingPong = false;
                     kaPingAt      = 0;
@@ -2069,13 +2035,6 @@ void loop() {
                 ledFlashER();
                 lastDisconnectMs = millis();
                 clearBuffers();
-                for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
-                swAckValid   = false;
-                swWinHead    = 0;
-                dataTxSeq    = 0;
-                swAckedSeq   = 0;
-                rxAckValid   = false;
-                rxAckedSeq   = 0;
                 kaInitiator  = false;
                 kaMissed     = 0;
                 kaLastPingMs = 0;
@@ -2089,19 +2048,7 @@ void loop() {
         }
     }
 
-        // ── 11. SWFLOW: retransmit timed-out window slots ────────────────────────
-    if (flowMode == 2 && (state == S_DATA || state == S_CONNECTED)
-        && !radioXoffRecv) {   // don't retransmit while remote says stop
-        for (uint8_t i = 0; i < SW_WIN_SIZE; i++) {
-            if (swWin[i].used && (millis() - swWin[i].sentMs) >= SW_RETX_MS) {
-                openWritePipe(remoteMac);
-                bool ok = radio.write(swWin[i].pkt, PAYLOAD_SIZE);
-                if (ok) ledFlashSD(); else ledFlashER();
-                openListenPipes();
-                swWin[i].sentMs = millis();
-            }
-        }
-    }
+
 
     // ── 13. Radio health check (every 500 ms) ────────────────────────────────
     if (now - lastHealthMs >= HEALTH_INTERVAL_MS) {
