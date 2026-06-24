@@ -90,6 +90,10 @@
 #include <RF24.h>
 #include <EEPROM.h>
 
+// ── Firmware version ───────────────────────────────────────────────────────────
+// Increment minor version (v1.x.0) on every code modification.
+#define MODEM_VERSION "v1.1.0"
+
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
 #define CSN_PIN  8    // RF-Nano: nRF24L01 CSN hardwired to D8
@@ -936,7 +940,8 @@ void processCommand(const char *cmd) {
 
     // ── ATI ─────────────────────────────────────────────────────────────────
     if (strcmp(uc, "ATI") == 0) {
-        Serial.println(F("nRF24L01 AT Modem v1.0"));
+        Serial.print(F("nRF24L01 AT Modem "));
+        Serial.println(F(MODEM_VERSION));
 
         // Radio hardware status — re-check live so ATI always reflects reality.
         bool chipOk = radio.isChipConnected();
@@ -1425,7 +1430,9 @@ void setup() {
     applyRadioConfig();
     openListenPipes();
 
-    Serial.println(F("nRF24L01 AT Modem ready."));
+    Serial.print(F("nRF24L01 AT Modem "));
+    Serial.print(F(MODEM_VERSION));
+    Serial.println(F(" ready."));
     Serial.println(F("Type ATI for status."));
 
     if (startupSlot < DIAL_SLOTS && dialStr[startupSlot][0] != '\0') {
