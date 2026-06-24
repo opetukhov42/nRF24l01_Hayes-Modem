@@ -52,6 +52,7 @@
  *                      S13 flow control: 0=none, 1=XON/XOFF (default 1)
  *                      S14 busy detect enable: 1=on (default), 0=off
  *                      S15 channel scan duration ms before dial (default 50)
+ *                      S16 transparent mode TX idle flush ms (default 5)
  *   ATSn?            – query S-register n (returns zero-padded 3-digit value)
  *   AT&F            – factory reset: restore all defaults and overwrite EEPROM
  *   AT&Zn=string     – store dial string in slot n (n=0-3); AT&Zn= clears slot
@@ -61,7 +62,7 @@
  *   ATSBAUD=n        – set baud rate (9600/19200/38400/57600/115200/250000/500000/1000000)
  *                    OK is sent at old rate, then port switches — match your terminal!
  *   ATSBAUD?         – query current baud rate
- *   ATSFLOW=n        – set flow/ACK mode: 0=none (reserved), 1=HW ACK, 2=SW flow control (default)
+ *   ATSFLOW=n        – set flow/ACK mode: 0=transparent (no framing/ACK), 1=HW ACK, 2=SW flow control (default)
  *   ATSFLOW?         – query flow mode
  *   ATE0 / ATE1      – echo off / on
  *   +++              – escape data mode → command mode (1 s guard time each side)
@@ -92,7 +93,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.7.0"
+#define MODEM_VERSION "v1.9.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -161,6 +162,7 @@
 #define EE_S13       88    // byte 88      S13: flow control mode (0=none, 1=XON/XOFF)
 #define EE_S14       89    // byte 89      S14: busy detect enable (1=on, 0=off)
 #define EE_S15       90    // byte 90      S15: channel scan duration ms
+#define EE_S16       91    // byte 91      S16: transparent mode TX idle flush ms
 
 #define DIAL_SLOTS      4
 #define DIAL_STR_LEN   16   // max chars, not counting NUL
@@ -191,6 +193,7 @@ uint8_t regS12       = 3;     // S12: missed pongs before dropping connection
 uint8_t regS13       = 1;     // S13: flow control 0=none, 1=XON/XOFF (default ON)
 uint8_t regS14       = 1;     // S14: busy detect enable (1=on, 0=off)
 uint8_t regS15       = 50;    // S15: channel scan duration in ms (default 50)
+uint8_t regS16       = 5;     // S16: transparent mode TX idle flush ms (default 5)
 
 // Data-loss counters (reset by ATI or AT&F)
 uint32_t txDropped   = 0;    // bytes dropped: serial→radio direction (host sent too fast)
@@ -249,6 +252,14 @@ uint8_t rxExpected = 0;
 
 // Flow / ACK mode: 0=none (reserved), 1=HWACK (hardware ACK), 2=SWFLOW (software flow control, default)
 uint8_t flowMode = 2;
+
+// ── Transparent mode (flowMode == 0) TX buffer ───────────────────────────────
+// Bytes accumulate here until the buffer is full (32 bytes) or the idle timer
+// fires (~5 ms after last byte), then the whole buffer is sent as a raw payload.
+uint8_t  transBuf[PAYLOAD_SIZE];
+uint8_t  transBufLen    = 0;
+unsigned long transLastByteMs = 0;   // millis() of last byte pushed to transBuf
+// TRANS_IDLE_MS replaced by S16 register (regS16) — see ATSn handler
 
 // Baud rate table — index stored in EEPROM, not the raw value (saves 2 bytes).
 // Valid indices 0-7 matching baudTable[]. Default index 4 = 115200.
@@ -405,6 +416,7 @@ void loadConfig() {
     regS13 = EEPROM.read(EE_S13); if (regS13 > 1)       regS13 = 1;
     regS14 = EEPROM.read(EE_S14); if (regS14 > 1)       regS14 = 1;
     regS15 = EEPROM.read(EE_S15); if (regS15 == 0 || regS15 == 0xFF) regS15 = 50;
+    regS16 = EEPROM.read(EE_S16); if (regS16 == 0 || regS16 == 0xFF) regS16 = 5;
 }
 
 void saveConfig() {
@@ -435,6 +447,7 @@ void saveConfig() {
     EEPROM.write(EE_S13,      regS13);
     EEPROM.write(EE_S14,      regS14);
     EEPROM.write(EE_S15,      regS15);
+    EEPROM.write(EE_S16,      regS16);
     EEPROM.write(EE_MAGIC,    EEPROM_MAGIC);
 }
 
@@ -884,6 +897,7 @@ void factoryReset() {
     regS13 = 1;
     regS14 = 1;
     regS15 = 50;
+    regS16 = 5;
     txDropped = 0;
     rxDropped = 0;
 
@@ -994,7 +1008,7 @@ void processCommand(const char *cmd) {
 
         Serial.print(F("Baud    : ")); Serial.println(baudTable[baudIdx]);
         Serial.print(F("Flow mode: "));
-        if      (flowMode == 0) Serial.println(F("0 (none - reserved)"));
+        if      (flowMode == 0) Serial.println(F("0 (transparent - no framing)"));
         else if (flowMode == 1) Serial.println(F("1 (HWACK - hardware ACK)"));
         else                    Serial.println(F("2 (SWFLOW - software flow control)"));
         Serial.print(F("Channel : ")); Serial.println(channel);
@@ -1022,6 +1036,7 @@ void processCommand(const char *cmd) {
         Serial.print(F("S13     : ")); Serial.println(regS13 == 1 ? F("1 (XON/XOFF enabled)") : F("0 (no flow control)"));
         Serial.print(F("S14     : ")); Serial.println(regS14 == 1 ? F("1 (busy detect ON)") : F("0 (busy detect OFF)"));
         Serial.print(F("S15     : ")); Serial.print(regS15); Serial.println(F(" ms (channel scan duration)"));
+        Serial.print(F("S16     : ")); Serial.print(regS16); Serial.println(F(" ms (transparent TX idle flush)"));
         Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (serial->radio, host overflow)"));
         Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (radio->serial, radio overflow)"));
         if (txDropped || rxDropped) Serial.println(F("** DATA LOSS DETECTED — consider enabling XON/XOFF (ATS13=1) **"));
@@ -1071,6 +1086,7 @@ void processCommand(const char *cmd) {
     if (strcmp(uc, "ATH") == 0 || strcmp(uc, "ATH0") == 0) {
         // Clear SWFLOW window, buffers, and cancel any pending retry on hangup.
         clearBuffers();
+        transBufLen = 0;
         for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
         swAckValid     = false;
         swWinHead      = 0;
@@ -1177,6 +1193,16 @@ void processCommand(const char *cmd) {
             strncpy(lastDialStr, cmd, sizeof(lastDialStr) - 1);
             lastDialStr[sizeof(lastDialStr) - 1] = '\0';
 
+            // Transparent mode (flowMode=0): instant connect, no handshake.
+            if (flowMode == 0) {
+                clearBuffers();
+                transBufLen   = 0;
+                transLastByteMs = 0;
+                state = S_DATA;
+                sendConnect();
+                return;
+            }
+
             // S6: pre-dial wait.
             uint8_t prewait = (regS6 > 10) ? 10 : regS6;
             if (prewait > 0) delay((uint16_t)prewait * 1000UL);
@@ -1186,7 +1212,6 @@ void processCommand(const char *cmd) {
                 if (channelIsBusy()) {
                     Serial.println(F("BUSY"));
                     ledFlashER();
-                    // Do not set S_CONNECTING — leave IDLE, no retry.
                     return;
                 }
             }
@@ -1258,6 +1283,7 @@ void processCommand(const char *cmd) {
             case 13: regPtr = &regS13; break;
             case 14: regPtr = &regS14; break;
             case 15: regPtr = &regS15; break;
+            case 16: regPtr = &regS16; break;
             default: sendError(); return;
         }
 
@@ -1355,7 +1381,7 @@ void processCommand(const char *cmd) {
 
     // ── ATSFLOW? / ATSFLOW=n ────────────────────────────────────────────────
     if (strcmp(uc, "ATSFLOW?") == 0) {
-        if      (flowMode == 0) Serial.println(F("0 (none - reserved)"));
+        if      (flowMode == 0) Serial.println(F("0 (transparent)"));
         else if (flowMode == 1) Serial.println(F("1 (HWACK)"));
         else                    Serial.println(F("2 (SWFLOW)"));
         sendOK();
@@ -1454,6 +1480,27 @@ void checkRadioHealth() {
     }
 }
 
+// ── Transparent mode TX flush ────────────────────────────────────────────────
+// Called every loop iteration when flowMode==0 and state==S_DATA.
+// Sends accumulated bytes as a raw 32-byte payload (no header, no framing).
+// Flushes when: buffer full, or S16 ms have passed since last byte (regS16, default 5).
+void flushTransparent() {
+    if (transBufLen == 0) return;
+    bool full    = (transBufLen >= PAYLOAD_SIZE);
+    bool timeout = (millis() - transLastByteMs >= (unsigned long)regS16);
+    if (!full && !timeout) return;
+
+    // Pad remainder with 0x00 so the remote knows payload length implicitly
+    // from the content — it's the application's responsibility in this mode.
+    // Send exactly PAYLOAD_SIZE bytes (nRF24L01 fixed payload).
+    openWritePipe(remoteMac);
+    radio.write(transBuf, PAYLOAD_SIZE);
+    ledFlashSD();
+    openListenPipes();
+    transBufLen     = 0;
+    transLastByteMs = 0;
+}
+
 // ── Setup ─────────────────────────────────────────────────────────────────────
 void setup() {
     ledSetup();
@@ -1526,11 +1573,19 @@ void loop() {
             checkEscape(b);
 
             if (plusCount == 255) {
-                // Third '+' received — start post-guard timer
-                // We don't push '+' chars to TX (they're escape, not data)
-                // Nothing else to do here; escape confirmed after 1 s below
+                // Third '+' received — start post-guard timer; don't push to TX
             } else if (!escapeArmed) {
-                txPush(b);
+                if (flowMode == 0) {
+                    // Transparent mode: feed raw TX buffer directly
+                    if (transBufLen < PAYLOAD_SIZE) {
+                        transBuf[transBufLen++] = b;
+                        transLastByteMs = millis();
+                    }
+                    // If buffer full, flush immediately via flushTransparent()
+                    // called later in loop()
+                } else {
+                    txPush(b);
+                }
             }
         } else {
             // Command mode
@@ -1607,7 +1662,18 @@ void loop() {
     if (radio.available()) {
         uint8_t pkt[PAYLOAD_SIZE];
         radio.read(pkt, PAYLOAD_SIZE);
-        handleRadioPacket(pkt);
+        if (flowMode == 0 && (state == S_DATA || state == S_CONNECTED)) {
+            // Transparent mode: dump all bytes straight to serial.
+            // The application owns framing/length — we write all PAYLOAD_SIZE bytes.
+            ledFlashRD();
+            for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
+                if (regS13 == 1 && (pkt[i] == 0x11 || pkt[i] == 0x13)) continue; // honour XON/XOFF filter
+                if (!rxPush(pkt[i])) { rxDropped++; ledFlashER(); }
+            }
+            checkFlowControl();
+        } else {
+            handleRadioPacket(pkt);
+        }
     }
 
     // ── 6. Drain RX buffer → serial ─────────────────────────────────────────
@@ -1618,7 +1684,11 @@ void loop() {
     }
 
     // ── 7. Flush TX buffer → radio ───────────────────────────────────────────
-    flushTxBuffer();
+    if (flowMode == 0 && (state == S_DATA || state == S_CONNECTED)) {
+        flushTransparent();
+    } else {
+        flushTxBuffer();
+    }
 
     // ── 8. Flow control check ────────────────────────────────────────────────
     checkFlowControl();
