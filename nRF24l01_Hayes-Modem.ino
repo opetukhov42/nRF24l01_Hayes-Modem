@@ -95,7 +95,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.13.0"
+#define MODEM_VERSION "v1.14.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -981,41 +981,54 @@ void spectrumScan() {
     static const char density[] = " .:-=+*#@%";
     //                              0 1  2  3  4  5  6  7  8  9+
 
-    radio.stopListening();
-
     while (true) {
         // Check for keypress — any byte stops the scan
         if (Serial.available()) {
-            Serial.read();   // consume the byte
+            Serial.read();
             break;
         }
 
         Serial.print(F("     "));   // indent to align with ruler
 
         for (uint8_t ch = 0; ch < 126; ch++) {
+            // Switch channel and start listening — this is essential:
+            // RPD only works in RX mode, and startListening() resets the
+            // RPD latch so stale detections from the previous channel don't
+            // carry over. Without this, testRPD() always returns 0.
             radio.setChannel(ch);
-            delayMicroseconds(130);   // settling time after channel switch
+            radio.startListening();
+            // Wait at least 170 µs for the synthesiser to settle and the
+            // RPD comparator to become valid after startListening().
+            delayMicroseconds(200);
 
-            // Sample RPD for regS17 milliseconds
+            // Sample RPD for regS17 milliseconds.
+            // The RPD latch is set by hardware when signal > -64 dBm and
+            // cleared only by startListening() — so a single hit per
+            // channel is meaningful. We count hits across multiple 1ms
+            // samples to get a density measure.
             uint8_t hits = 0;
             unsigned long start = millis();
             while (millis() - start < (unsigned long)regS17) {
                 if (radio.testRPD()) hits++;
-                delay(1);
+                // Re-arm the latch: stopListening()+startListening() resets RPD
+                // so we can detect multiple bursts within the dwell window.
+                radio.stopListening();
+                radio.startListening();
+                delayMicroseconds(200);
             }
 
             // Map hits to density character (clamp to index 9)
-            uint8_t idx = hits / 2;          // 0-1→0, 2-3→1, 4-5→2 ...
+            uint8_t idx = hits / 2;
             if (idx > 9) idx = 9;
             Serial.write(density[idx]);
 
-            // Check for keypress between channels too
+            // Check for keypress between channels
             if (Serial.available()) {
                 Serial.read();
                 goto scan_done;
             }
         }
-        Serial.println();   // end of sweep — CR+LF, start new line
+        Serial.println();   // end of sweep — CR+LF
     }
 
 scan_done:
