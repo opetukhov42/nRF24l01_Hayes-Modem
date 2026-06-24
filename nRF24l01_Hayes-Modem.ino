@@ -103,7 +103,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.45.0"
+#define MODEM_VERSION "v1.47.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -321,6 +321,7 @@ bool     escapeArmed = false;    // true after first guard silence
 
 // SWFLOW duplicate detection
 uint8_t  rxLastSeq   = 0xFF;    // last accepted PKT_DATA seq (0xFF = none yet)
+bool     testStopFlag = false;  // set by flushTxBuffer when PKT_TEST_STOP received
 
 // ── LED helpers ───────────────────────────────────────────────────────────────
 
@@ -679,6 +680,9 @@ void flushTxBuffer() {
                     gotAck = true;
                 } else if (pt == PKT_XON || pt == PKT_XOFF) {
                     handleRadioPacket(tmp);
+                } else if (pt == PKT_TEST_STOP) {
+                    testStopFlag = true;   // signal test loop to exit
+                    gotAck = true;         // exit retransmit loop cleanly
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
@@ -810,6 +814,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 swLastPktValid = false;
                 rxLastSeq      = 0xFF;
                 swRetxCount    = 0;
+                testStopFlag   = false;
                 kaInitiator   = true;
                 kaMissed      = 0;
                 kaWaitingPong = false;
@@ -935,6 +940,7 @@ void doAnswer() {
     swLastPktValid = false;
     rxLastSeq      = 0xFF;
     swRetxCount    = 0;
+    testStopFlag   = false;
     sendConnectAck();
     kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
     kaMissed      = 0;
@@ -1194,19 +1200,25 @@ void speedTestTX() {
         // Keypress — send stop signal to RX then exit
         if (Serial.available()) {
             Serial.read();
-            sendControlPacket(PKT_TEST_STOP);
+            // Send PKT_TEST_STOP 3× with short gaps — no ACK on control
+            // packets so we repeat to reduce chance of RF loss.
+            for (uint8_t i = 0; i < 3; i++) {
+                sendControlPacket(PKT_TEST_STOP);
+                delay(10);
+            }
             break;
         }
 
-        // Check if RX sent PKT_TEST_STOP (they pressed a key first)
-        if (pendingPktReady && pendingPkt[0] == PKT_TEST_STOP) {
+        // Check for stop signal — either via testStopFlag (set inside
+        // flushTxBuffer's ACK wait) or via pendingPkt (set between iterations)
+        if (testStopFlag ||
+            (pendingPktReady && pendingPkt[0] == PKT_TEST_STOP)) {
+            testStopFlag    = false;
             pendingPktReady = false;
             Serial.print(F("\r\n[TX] RX stopped the test\r\n"));
             break;
         }
-        if (pendingPktReady) {
-            pendingPktReady = false;  // discard other pending packets during test
-        }
+        if (pendingPktReady) { pendingPktReady = false; }
 
         // Build and send test payload
         uint8_t payload[TEST_PAY];
@@ -1218,15 +1230,7 @@ void speedTestTX() {
         totalBytes += TEST_PAY;
         seqNum++;
 
-        // Also check radio directly for PKT_TEST_STOP during ACK wait
-        if (radio.available()) {
-            uint8_t tmp[PAYLOAD_SIZE];
-            radio.read(tmp, PAYLOAD_SIZE);
-            if (tmp[0] == PKT_TEST_STOP) {
-                Serial.print(F("\r\n[TX] RX stopped the test\r\n"));
-                goto tx_done;
-            }
-        }
+        // testStopFlag checked at loop top covers this case
 
         unsigned long now = millis();
         if (now - lastStats >= TEST_STATS_MS) {
@@ -1284,7 +1288,11 @@ void speedTestRX() {
         // Keypress — tell TX we stopped, then exit
         if (Serial.available()) {
             Serial.read();
-            sendControlPacket(PKT_TEST_STOP);
+            // Send PKT_TEST_STOP 3× with short gaps for reliability
+            for (uint8_t i = 0; i < 3; i++) {
+                sendControlPacket(PKT_TEST_STOP);
+                delay(10);
+            }
             break;
         }
 
