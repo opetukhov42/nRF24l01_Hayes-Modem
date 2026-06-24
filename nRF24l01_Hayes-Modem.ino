@@ -96,7 +96,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.34.0"
+#define MODEM_VERSION "v1.36.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -290,9 +290,9 @@ unsigned long autoDialMs = 0;  // millis() timestamp to fire autodial
 // ── SWFLOW retransmit window ──────────────────────────────────────────────────
 // Holds up to SW_WIN_SIZE unacknowledged outbound packets so we can retransmit
 // on PKT_NACK. Each slot stores the raw 32-byte payload and a send timestamp.
-#define SW_WIN_SIZE   4
-#define SW_RETX_MS  2000  // retransmit slot if no SWACK within 2 s (safety net only;
-                               //   primary recovery is NACK-based)
+#define SW_WIN_SIZE   1   // stop-and-wait: one packet in flight at a time
+#define SW_RETX_MS 10000  // retransmit only after 10 s silence — true last resort;
+                               //   primary recovery is NACK-based via SW_ACK_WAIT
 #define SW_ACK_WAIT_MS  5  // ms to stay in RX after sending a data packet,
                                //   giving the remote time to send its SWACK back
 
@@ -753,11 +753,15 @@ void handleRadioPacket(const uint8_t *pkt) {
         case PKT_DATA:
             if (state == S_DATA || state == S_CONNECTED) {
                 ledFlashRD();
-                swflowAckData(pkt[1]);   // no-op unless SWFLOW mode
-                for (uint8_t i = 0; i < len && i < MAX_DATA; i++) {
-                    rxPush(pkt[DATA_OFFSET + i]);
+                // swflowAckData returns false for duplicates and out-of-order
+                // packets — discard the data in those cases to prevent
+                // corruption from retransmits and gap-fill arrivals.
+                if (swflowAckData(pkt[1])) {
+                    for (uint8_t i = 0; i < len && i < MAX_DATA; i++) {
+                        rxPush(pkt[DATA_OFFSET + i]);
+                    }
+                    checkFlowControl();
                 }
-                checkFlowControl();
             }
             break;
 
@@ -906,15 +910,30 @@ void handleRadioPacket(const uint8_t *pkt) {
 }
 
 // ── SWFLOW receiver: send SWACK and detect gaps ───────────────────────────────
-// Called from handleRadioPacket for every PKT_DATA in SWFLOW mode.
-// Sends a NACK if a gap is detected, then a SWACK after each in-order packet.
-void swflowAckData(uint8_t seq) {
-    if (flowMode != 2) return;   // SWACK only used in SWFLOW mode
+// Returns true if the packet data should be accepted into rxBuf, false if it
+// should be discarded (gap/duplicate). Caller must check the return value.
+bool swflowAckData(uint8_t seq) {
+    if (flowMode != 2) return true;   // non-SWFLOW: always accept
 
     if (rxAckValid) {
         uint8_t expected = (uint8_t)(rxAckedSeq + 1);
+        if (seq == rxAckedSeq) {
+            // Duplicate — sender retransmitted something we already ACKed.
+            // Re-send SWACK to unblock the sender but discard the data.
+            uint8_t ackPkt[PAYLOAD_SIZE];
+            memset(ackPkt, 0, PAYLOAD_SIZE);
+            bool weHaveData = (txAvail() > 0) && !radioXoffRecv;
+            ackPkt[0] = weHaveData ? PKT_SWACK_YIELD : PKT_SWACK;
+            ackPkt[1] = txSeq++;
+            ackPkt[2] = 1;
+            ackPkt[DATA_OFFSET] = seq;
+            openWritePipe(remoteMac);
+            radio.write(ackPkt, PAYLOAD_SIZE);
+            openListenPipes();
+            return false;   // discard duplicate data
+        }
         if (seq != expected) {
-            // Gap detected — request the missing seq.
+            // Gap — request the missing seq, discard this out-of-order packet.
             uint8_t nackPkt[PAYLOAD_SIZE];
             memset(nackPkt, 0, PAYLOAD_SIZE);
             nackPkt[0] = PKT_NACK;
@@ -924,7 +943,7 @@ void swflowAckData(uint8_t seq) {
             openWritePipe(remoteMac);
             radio.write(nackPkt, PAYLOAD_SIZE);
             openListenPipes();
-            return;   // don't advance rxAckedSeq until gap is filled
+            return false;   // discard out-of-order data
         }
     }
     // In-order: send SWACK. If we also have data pending, use PKT_SWACK_YIELD
@@ -942,6 +961,7 @@ void swflowAckData(uint8_t seq) {
     bool ok = radio.write(ackPkt, PAYLOAD_SIZE);
     if (ok) ledFlashSD(); else ledFlashER();
     openListenPipes();
+    return true;   // in-order packet — caller should accept the data
 }
 
 // Complete an incoming call: copy pending MAC, ACK the caller, enter DATA mode.
