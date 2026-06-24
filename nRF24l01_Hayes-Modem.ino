@@ -96,7 +96,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.33.0"
+#define MODEM_VERSION "v1.34.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -631,13 +631,34 @@ void flushTxBuffer() {
     if (radioXoffRecv) return;   // remote asked us to pause
 
     // Cooperative duplex (SWFLOW only): remote sent SWACK_YIELD meaning it has
-    // data queued for us. Skip this TX turn so it can transmit without collision.
-    // Flag cleared here — remote gets exactly one uncontested TX slot per yield,
-    // then we resume normally next loop iteration.
-    // In HWACK/none mode yieldToRemote is never set so this path is never taken.
+    // data queued for us. Actively wait for the remote's packet to arrive so
+    // it gets a real uncontested TX window, not just one skipped loop iteration
+    // (which would be immediately re-entered if our TX buffer is still full).
+    // In HWACK/none mode yieldToRemote is never set so this is never taken.
     if (yieldToRemote) {
         yieldToRemote = false;
-        return;
+        // Wait up to 2×SW_ACK_WAIT_MS for the remote's data packet.
+        // Process it immediately so our next SWACK carries accurate yield flag.
+        unsigned long yieldUntil = millis() + SW_ACK_WAIT_MS * 2;
+        while (millis() < yieldUntil) {
+            if (radio.available()) {
+                uint8_t tmpPkt[PAYLOAD_SIZE];
+                radio.read(tmpPkt, PAYLOAD_SIZE);
+                uint8_t ptype = tmpPkt[0];
+                if (ptype == PKT_SWACK || ptype == PKT_SWACK_YIELD ||
+                    ptype == PKT_NACK  || ptype == PKT_XON ||
+                    ptype == PKT_XOFF) {
+                    handleRadioPacket(tmpPkt);
+                } else {
+                    if (!pendingPktReady) {
+                        memcpy(pendingPkt, tmpPkt, PAYLOAD_SIZE);
+                        pendingPktReady = true;
+                    }
+                }
+                break;
+            }
+        }
+        return;  // always return after yield — let main loop drain pendingPkt first
     }
 
     while (txAvail() > 0) {
