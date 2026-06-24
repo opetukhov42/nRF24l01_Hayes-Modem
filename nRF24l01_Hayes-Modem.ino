@@ -96,7 +96,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.29.0"
+#define MODEM_VERSION "v1.33.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -226,7 +226,7 @@ unsigned long lastConnMs = 0;  // millis() of last PKT_CONN received (ring timeo
 
 // Circular buffers
 uint8_t rxBuf[RX_BUF_SIZE];
-volatile uint16_t rxHead = 0, rxTail = 0;
+uint16_t rxHead = 0, rxTail = 0;
 
 uint8_t txBuf[TX_BUF_SIZE];
 uint16_t txHead = 0, txTail = 0;
@@ -260,7 +260,6 @@ unsigned long lastSerialMs = 0;
 // Sequence numbers
 uint8_t txSeq     = 0;    // sequence counter for ALL outbound packets
 uint8_t dataTxSeq = 0;    // sequence counter for PKT_DATA only (SWFLOW window)
-uint8_t rxExpected = 0;
 
 // Flow / ACK mode: 0=none (reserved), 1=HWACK (hardware ACK), 2=SWFLOW (software flow control, default)
 uint8_t flowMode = 2;
@@ -282,8 +281,6 @@ const uint32_t baudTable[] = {
 const uint8_t  BAUD_TABLE_SIZE = 8;
 const uint8_t  BAUD_DEFAULT    = 4;   // 115200
 uint8_t        baudIdx         = BAUD_DEFAULT;
-bool           pendingBaudChange = false;   // apply after OK is flushed
-
 // Dial string profiles and startup autodial
 char    dialStr[DIAL_SLOTS][DIAL_STR_LEN + 1];  // "" = empty slot
 uint8_t startupSlot = 0xFF;                      // 0xFF = autodial disabled
@@ -390,9 +387,9 @@ void updateFlashLEDs() {
 void macToAddr(const uint8_t mac[3], uint8_t addr[5]) {
     addr[0] = 0xAB;
     addr[1] = 0xCD;
-    addr[2] = 0xEF;
-    addr[3] = mac[0];
-    addr[4] = mac[1] ^ mac[2];   // fold last byte for variety
+    addr[2] = mac[0];   // all 3 MAC bytes used directly — no XOR fold
+    addr[3] = mac[1];   // avoids collision between MACs sharing last 2 bytes
+    addr[4] = mac[2];
 }
 
 // ── EEPROM helpers ────────────────────────────────────────────────────────────
@@ -433,36 +430,38 @@ void loadConfig() {
 }
 
 void saveConfig() {
-    EEPROM.write(EE_OWN_MAC,     ownMac[0]);
-    EEPROM.write(EE_OWN_MAC + 1, ownMac[1]);
-    EEPROM.write(EE_OWN_MAC + 2, ownMac[2]);
-    EEPROM.write(EE_REM_MAC,     remoteMac[0]);
-    EEPROM.write(EE_REM_MAC + 1, remoteMac[1]);
-    EEPROM.write(EE_REM_MAC + 2, remoteMac[2]);
-    EEPROM.write(EE_CHANNEL,  channel);
-    EEPROM.write(EE_SPEED,    speedEnum);
-    EEPROM.write(EE_S0,       regS0);
-    EEPROM.write(EE_FLOW,     flowMode);
-    EEPROM.write(EE_BAUD,     baudIdx);
+    // EEPROM.update() reads before writing — skips the write if value
+    // is unchanged, dramatically reducing wear on frequently-saved bytes.
+    EEPROM.update(EE_OWN_MAC,     ownMac[0]);
+    EEPROM.update(EE_OWN_MAC + 1, ownMac[1]);
+    EEPROM.update(EE_OWN_MAC + 2, ownMac[2]);
+    EEPROM.update(EE_REM_MAC,     remoteMac[0]);
+    EEPROM.update(EE_REM_MAC + 1, remoteMac[1]);
+    EEPROM.update(EE_REM_MAC + 2, remoteMac[2]);
+    EEPROM.update(EE_CHANNEL,  channel);
+    EEPROM.update(EE_SPEED,    speedEnum);
+    EEPROM.update(EE_S0,       regS0);
+    EEPROM.update(EE_FLOW,     flowMode);
+    EEPROM.update(EE_BAUD,     baudIdx);
     for (uint8_t s = 0; s < DIAL_SLOTS; s++) {
         uint8_t base = EE_DIALSTR0 + s * (DIAL_STR_LEN + 1);
         for (uint8_t c = 0; c <= DIAL_STR_LEN; c++)
-            EEPROM.write(base + c, (uint8_t)dialStr[s][c]);
+            EEPROM.update(base + c, (uint8_t)dialStr[s][c]);
     }
-    EEPROM.write(EE_STARTUP,  startupSlot);
-    EEPROM.write(EE_S6,       regS6);
-    EEPROM.write(EE_S7,       regS7);
-    EEPROM.write(EE_S8,       regS8);
-    EEPROM.write(EE_S9,       regS9);
-    EEPROM.write(EE_S10,      regS10);
-    EEPROM.write(EE_S11,      regS11);
-    EEPROM.write(EE_S12,      regS12);
-    EEPROM.write(EE_S13,      regS13);
-    EEPROM.write(EE_S14,      regS14);
-    EEPROM.write(EE_S15,      regS15);
-    EEPROM.write(EE_S16,      regS16);
-    EEPROM.write(EE_S17,      regS17);
-    EEPROM.write(EE_MAGIC,    EEPROM_MAGIC);
+    EEPROM.update(EE_STARTUP,  startupSlot);
+    EEPROM.update(EE_S6,       regS6);
+    EEPROM.update(EE_S7,       regS7);
+    EEPROM.update(EE_S8,       regS8);
+    EEPROM.update(EE_S9,       regS9);
+    EEPROM.update(EE_S10,      regS10);
+    EEPROM.update(EE_S11,      regS11);
+    EEPROM.update(EE_S12,      regS12);
+    EEPROM.update(EE_S13,      regS13);
+    EEPROM.update(EE_S14,      regS14);
+    EEPROM.update(EE_S15,      regS15);
+    EEPROM.update(EE_S16,      regS16);
+    EEPROM.update(EE_S17,      regS17);
+    EEPROM.update(EE_MAGIC,    EEPROM_MAGIC);
 }
 
 // ── Radio setup ───────────────────────────────────────────────────────────────
@@ -548,7 +547,6 @@ void clearBuffers() {
 // receive channel to indicate signal presence. For a rough dBm estimate
 // we scan the current channel 64 times and count CD hits.
 int8_t readRSSI() {
-    bool wasListening = radio.isChipConnected();
     radio.startListening();
     delayMicroseconds(128);
     uint8_t hits = 0;
@@ -711,14 +709,16 @@ void checkFlowControl() {
         hostXoffSent = false;  // S13=0: never assert XOFF to host
     }
 
-    // Tell remote to stop
-    if (!radioXoffSent && used >= XOFF_THRESHOLD) {
-        sendControlPacket(PKT_XOFF);
-        radioXoffSent = true;
-    }
-    if (radioXoffSent && used <= XON_THRESHOLD) {
-        sendControlPacket(PKT_XON);
-        radioXoffSent = false;
+    // Tell remote to stop — only when connected
+    if (state == S_DATA || state == S_CONNECTED) {
+        if (!radioXoffSent && used >= XOFF_THRESHOLD) {
+            sendControlPacket(PKT_XOFF);
+            radioXoffSent = true;
+        }
+        if (radioXoffSent && used <= XON_THRESHOLD) {
+            sendControlPacket(PKT_XON);
+            radioXoffSent = false;
+        }
     }
 }
 
@@ -782,7 +782,10 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaWaitingPong = false;
                 kaPingAt      = 0;
                 kaLastPingMs  = 0;
-                yieldToRemote = false;
+                yieldToRemote  = false;
+                radioXoffRecv  = false;
+                radioXoffSent  = false;
+                hostXoffSent   = false;
                 state = S_IDLE;
                 openListenPipes();
                 sendNoCarrier();
@@ -923,7 +926,11 @@ void swflowAckData(uint8_t seq) {
 // Complete an incoming call: copy pending MAC, ACK the caller, enter DATA mode.
 void doAnswer() {
     memcpy(remoteMac, pendingMac, 3);
-    saveConfig();                  // persist new remote MAC
+    // Only persist remoteMac — full saveConfig() on every call wastes EEPROM
+    // write cycles. update() skips the write if value is unchanged.
+    EEPROM.update(EE_REM_MAC,     remoteMac[0]);
+    EEPROM.update(EE_REM_MAC + 1, remoteMac[1]);
+    EEPROM.update(EE_REM_MAC + 2, remoteMac[2]);
     clearBuffers();                // discard any stale pre-connect data
     // Reset all SWFLOW sequence state for the new session.
     for (uint8_t i = 0; i < SW_WIN_SIZE; i++) swWin[i].used = false;
@@ -1049,6 +1056,8 @@ void spectrumScan() {
     static const char density[] = " .:-=+*#@%";
     //                              0 1  2  3  4  5  6  7  8  9+
 
+    uint8_t sweepCount = 0;   // counts completed sweeps for footer interval
+
     while (true) {
         // Check for keypress — any byte stops the scan
         if (Serial.available()) {
@@ -1059,35 +1068,27 @@ void spectrumScan() {
         Serial.print(F("     "));   // indent to align with ruler
 
         for (uint8_t ch = 0; ch < 126; ch++) {
-            // Switch channel and start listening — this is essential:
-            // RPD only works in RX mode, and startListening() resets the
-            // RPD latch so stale detections from the previous channel don't
-            // carry over. Without this, testRPD() always returns 0.
-            radio.setChannel(ch);
-            radio.startListening();
-            // Wait at least 170 µs for the synthesiser to settle and the
-            // RPD comparator to become valid after startListening().
-            delayMicroseconds(200);
-
-            // Sample RPD for regS17 milliseconds.
-            // The RPD latch is set by hardware when signal > -64 dBm and
-            // cleared only by startListening() — so a single hit per
-            // channel is meaningful. We count hits across multiple 1ms
-            // samples to get a density measure.
+            // Each channel: perform regS17 independent RPD measurements.
+            // Each measurement: stop→start (resets latch) → settle 500µs → read.
+            // 500µs is conservative but reliable for PLL lock + RPD valid.
+            // With regS17=20 samples: ~10ms per channel, ~1.26s per sweep.
+            // Increase regS17 for denser/more reliable readings.
             uint8_t hits = 0;
-            unsigned long start = millis();
-            while (millis() - start < (unsigned long)regS17) {
-                if (radio.testRPD()) hits++;
-                // Re-arm the latch: stopListening()+startListening() resets RPD
-                // so we can detect multiple bursts within the dwell window.
+            for (uint8_t s = 0; s < regS17; s++) {
+                radio.setChannel(ch);
                 radio.stopListening();
-                radio.startListening();
-                delayMicroseconds(200);
+                radio.startListening();      // resets RPD latch cleanly
+                delayMicroseconds(500);      // PLL lock + RPD comparator valid
+                if (radio.testRPD()) hits++;
             }
 
-            // Map hits to density character (clamp to index 9)
-            uint8_t idx = hits / 2;
-            if (idx > 9) idx = 9;
+            // Map hits/regS17 percentage to density character:
+            // 0%→' ', 1-12%→'.', 13-25%→':', 26-37%→'-', 38-50%→'=',
+            // 51-62%→'+', 63-75%→'*', 76-87%→'#', 88-99%→'@', 100%→'%'
+            uint8_t pct = (uint8_t)((uint16_t)hits * 100 / regS17);
+            uint8_t idx = (pct == 0) ? 0 : (pct <= 12) ? 1 : (pct <= 25) ? 2 :
+                          (pct <= 37) ? 3 : (pct <= 50) ? 4 : (pct <= 62) ? 5 :
+                          (pct <= 75) ? 6 : (pct <= 87) ? 7 : (pct <= 99) ? 8 : 9;
             Serial.write(density[idx]);
 
             // Check for keypress between channels
@@ -1097,6 +1098,14 @@ void spectrumScan() {
             }
         }
         Serial.println();   // end of sweep — CR+LF
+        sweepCount++;
+        // Print footer ruler every 40 sweeps so the scale is always visible.
+        if (sweepCount >= 40) {
+            sweepCount = 0;
+            Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
+            Serial.println(F("Ch:  0         1         2         3         4         5         6         7         8         9         10        11        12"));
+            Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
+        }
     }
 
 scan_done:
@@ -1157,12 +1166,14 @@ bool parseMac(const char *str, uint8_t mac[3]) {
     for (uint8_t i = 0; i < 6; i++) {
         if (!isHexadecimalDigit(tmp[i])) return false;
     }
-    mac[0] = (uint8_t)strtol(tmp,     nullptr, 16) >> 4 & 0xFF;
-    // Manual 2-digit hex parse to avoid strtol offset issues:
-    char h[3] = {0};
-    h[0] = tmp[0]; h[1] = tmp[1]; mac[0] = (uint8_t)strtol(h, nullptr, 16);
-    h[0] = tmp[2]; h[1] = tmp[3]; mac[1] = (uint8_t)strtol(h, nullptr, 16);
-    h[0] = tmp[4]; h[1] = tmp[5]; mac[2] = (uint8_t)strtol(h, nullptr, 16);
+    // Parse each byte from two hex digit characters.
+    // hexVal: convert single hex char '0'-'9','A'-'F' to 0-15.
+    auto hexVal = [](char c) -> uint8_t {
+        return (c >= '0' && c <= '9') ? (c - '0') : (c - 'A' + 10);
+    };
+    mac[0] = (hexVal(tmp[0]) << 4) | hexVal(tmp[1]);
+    mac[1] = (hexVal(tmp[2]) << 4) | hexVal(tmp[3]);
+    mac[2] = (hexVal(tmp[4]) << 4) | hexVal(tmp[5]);
     return true;
 }
 
@@ -1299,6 +1310,9 @@ void processCommand(const char *cmd) {
     if (strcmp(uc, "ATH") == 0 || strcmp(uc, "ATH0") == 0) {
         lastDisconnectMs = millis();
         pendingPktReady  = false;
+        radioXoffRecv    = false;
+        radioXoffSent    = false;
+        hostXoffSent     = false;
         // Clear SWFLOW window, buffers, and cancel any pending retry on hangup.
         clearBuffers();
         transBufLen = 0;
@@ -1422,9 +1436,15 @@ void processCommand(const char *cmd) {
                 return;
             }
 
-            // S6: pre-dial wait.
-            uint8_t prewait = (regS6 > 10) ? 10 : regS6;
-            if (prewait > 0) delay((uint16_t)prewait * 1000UL);
+            // S6: pre-dial wait — non-blocking so serial/LEDs stay responsive.
+            if (regS6 > 0) {
+                unsigned long waitEnd = millis() + (unsigned long)regS6 * 1000UL;
+                while (millis() < waitEnd) {
+                    updateSteadyLEDs();
+                    updateFlashLEDs();
+                    lastSerialMs = millis(); // suppress TR flicker
+                }
+            }
 
             // S14: busy detect — scan channel before dialling.
             if (regS14 == 1) {
