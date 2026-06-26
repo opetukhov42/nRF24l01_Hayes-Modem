@@ -29,49 +29,60 @@
  * Library required: RF24 by TMRh20
  *   Install via Sketch → Include Library → Manage Libraries
  *
- * AT commands:
- *   ATI              – print modem info (model, channel, own MAC, remote MAC, RSSI)
- *   ATSPECTRUM        – sweep all 126 channels, print ASCII spectrum, any key stops
- *   ATPINGXXYYZZ      – send diagnostic ping to MAC XXYYZZ (idle only); prints PONG from XXXXXX
- *   ATTEST-TX         – speed test transmitter: flood packets with seq numbers
- *   ATTEST-RX         – speed test receiver: arm on magic, report stats every 1 s
- *   ATSMYMAC=XXYYZZ  – set own 3-byte MAC (hex, e.g. ATSMYMAC=A1B2C3)
- *   ATSMYMAC?        – query own MAC
- *   ATSETCH=nn       – set RF channel 0-125 (e.g. ATSETCH=76)
- *   ATSETCH?         – query RF channel
- *   ATSSPEED=n       – set link speed: 0=250k, 1=1M, 2=2M
- *   ATSSPEED?        – query link speed
- *   ATD XXYYZZ       – dial / connect to remote MAC (returns BUSY if channel occupied and S14=1)
- *   ATA              – manually answer an incoming call
+ * AT commands (connection):
+ *   ATD XXYYZZ       – dial remote MAC; BUSY if channel busy (S14=1)
+ *   ATA              – manually answer incoming call
  *   ATO              – return to data mode after +++ escape
- *   ATH              – hang up / reject incoming call
- *   ATSn=value       – set S-register n to value (all saved to EEPROM):
- *                      S0  auto-answer rings (0=off)
- *                      S6  pre-dial wait seconds (default 0, radio needs no dialtone)
- *                      S7  carrier wait / connect timeout seconds (default 3)
- *                      S8  dial retry attempts after failure (default 3, 0=no retry)
- *                      S9  inter-retry interval seconds (default 3)
- *                      S10 keep-alive enable (1=on default, 0=off)
- *                      S11 keep-alive interval seconds (default 5)
- *                      S12 missed pongs before drop (default 3)
- *                      S13 flow control: 0=none, 1=XON/XOFF (default 1)
- *                      S14 busy detect enable: 1=on (default), 0=off
- *                      S15 channel scan duration ms before dial (default 50)
- *                      S16 transparent mode TX idle flush ms (default 5)
- *                      S17 spectrum scan dwell ms per channel (default 20)
- *   ATSn?            – query S-register n (returns zero-padded 3-digit value)
- *   AT&F            – factory reset: restore all defaults and overwrite EEPROM
- *   AT&Zn=string     – store dial string in slot n (n=0-3); AT&Zn= clears slot
+ *   ATH              – hang up active connection (NO CARRIER) or reject ring (OK)
+ *   ATS0=n           – auto-answer after n rings (0=off)
+ *   +++              – escape data mode to command mode (1 s guard each side)
+ *
+ * AT commands (configuration):
+ *   ATI              – print full modem status (radio, state, MACs, RSSI, S-regs, counters)
+ *   ATE0 / ATE1      – echo off / on
+ *   ATSMYMAC=XXYYZZ  – set own 3-byte MAC (hex); saved to EEPROM
+ *   ATSMYMAC?        – query own MAC
+ *   ATSETCH=nn       – set RF channel 0-125 (default 97 = 2497 MHz, above WiFi+BT)
+ *   ATSETCH?         – query RF channel
+ *   ATSSPEED=n       – air data rate: 0=250 kbps, 1=1 Mbps (default), 2=2 Mbps
+ *   ATSSPEED?        – query air data rate
+ *   ATSBAUD=n        – set serial baud rate (2400/4800/9600/19200/38400/57600/
+ *                      115200/250000/500000/1000000); OK at old rate then switches
+ *   ATSBAUD?         – query current baud rate
+ *   ATSFLOW=n        – link mode: 0=transparent, 1=HWACK, 2=SWFLOW (default)
+ *   ATSFLOW?         – query link mode
+ *   AT&F             – factory reset: restore all defaults, rewrite EEPROM
+ *   AT&Zn=string     – store dial string in slot n (0-3); AT&Zn= clears slot
  *   AT&Zn?           – query stored dial string in slot n
  *   AT&Yn            – set startup autodial slot (fires 2 s after boot)
  *   AT&Y?            – query startup autodial slot
- *   ATSBAUD=n        – set baud rate (2400/4800/9600/19200/38400/57600/115200/250000/500000/1000000)
- *                    OK is sent at old rate, then port switches — match your terminal!
- *   ATSBAUD?         – query current baud rate
- *   ATSFLOW=n        – set flow/ACK mode: 0=transparent (no framing/ACK), 1=HW ACK, 2=SW flow control (default)
- *   ATSFLOW?         – query flow mode
- *   ATE0 / ATE1      – echo off / on
- *   +++              – escape data mode → command mode (1 s guard time each side)
+ *
+ * AT commands (diagnostics):
+ *   ATSPECTRUM       – sweep 126 channels, print ASCII spectrum; any key stops
+ *   ATPINGXXYYZZ     – diagnostic ping to MAC XXYYZZ (idle only); prints PONG from XXXXXX
+ *   ATREBOOT         – hardware reboot via watchdog (boots fresh from EEPROM)
+ *   ATTEST-TX        – speed test TX: flood sequenced packets; paired with ATTEST-RX
+ *   ATTEST-RX        – speed test RX: arm on magic, report throughput + link quality
+ *   ATTEST-ECHO      – speed test echo: reflect received packets back to sender
+ *
+ * S-registers (ATSn=value to set, ATSn? to query; all saved to EEPROM):
+ *   S0   auto-answer ring count (0=off, default 0)
+ *   S6   pre-dial wait seconds (0=none, default 0, non-blocking)
+ *   S7   carrier wait / connect timeout per attempt, seconds (default 3)
+ *        also used as ATPING reply timeout
+ *   S8   dial retry attempts after failure (0=no retry, 255=forever, default 3)
+ *   S9   inter-retry interval seconds (default 3)
+ *   S10  keep-alive enable: 1=on (default), 0=off
+ *   S11  keep-alive ping interval seconds (default 5)
+ *   S12  missed pings before NO CARRIER (default 3)
+ *   S13  XON/XOFF flow control: 1=on (default), 0=off
+ *        applies to both serial and radio links
+ *   S14  busy detect before dial: 1=on (default), 0=off
+ *   S15  busy detect sample count (each ~2 ms, default 50 ≈ 100 ms scan)
+ *   S16  transparent mode TX idle flush timeout ms (default 5)
+ *   S17  spectrum scan samples per channel (each ~500 µs, default 20)
+ *   S18  silent mode: 1=suppress all CLI serial output, 0=normal (default 0)
+ *        LEDs are unaffected. ATS18=0 always works even when silent.
  *
  * XON/XOFF flow control (active when S13=1, default ON):
  *   DC1 (0x11) = XON  – resume sending
@@ -99,11 +110,12 @@
 
 #include <SPI.h>
 #include <RF24.h>
+#include <avr/wdt.h>    // watchdog — used by ATREBOOT
 #include <EEPROM.h>
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.52.0"
+#define MODEM_VERSION "v1.61.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -178,6 +190,7 @@
 #define EE_S15       90    // byte 90      S15: channel scan duration ms
 #define EE_S16       91    // byte 91      S16: transparent mode TX idle flush ms
 #define EE_S17       92    // byte 92      S17: spectrum scan dwell ms per channel
+#define EE_S18       93    // byte 93      S18: silent mode (1=suppress all CLI output)
 
 #define DIAL_SLOTS      4
 #define DIAL_STR_LEN   16   // max chars, not counting NUL
@@ -210,6 +223,7 @@ uint8_t regS14       = 1;     // S14: busy detect enable (1=on, 0=off)
 uint8_t regS15       = 50;    // S15: channel scan duration in ms (default 50)
 uint8_t regS16       = 5;     // S16: transparent mode TX idle flush ms (default 5)
 uint8_t regS17       = 20;    // S17: spectrum scan dwell ms per channel (default 20)
+uint8_t regS18       = 0;     // S18: silent mode 0=normal, 1=suppress all CLI output
 
 unsigned long lastDisconnectMs = 0;  // millis() of last disconnect — busy detect grace period
 
@@ -225,7 +239,7 @@ bool          kaWaitingPong = false; // true between sending PING and receiving 
 unsigned long kaLastPingMs  = 0;     // answerer: millis() of last received PKT_PING (0=none yet)
 
 // Dial retry state (managed by the connect-timeout block in loop())
-uint8_t  dialRetryCount  = 0;          // retries fired so far for current dial
+uint32_t dialRetryCount  = 0;          // retries fired so far (uint32 for forever mode)
 bool     dialRetrying    = false;      // true while waiting between retries
 unsigned long dialRetryAt = 0;         // millis() when next retry fires
 char     lastDialStr[DIAL_STR_LEN + 5]; // "ATD XXYYZZ" copy for retransmission
@@ -422,7 +436,9 @@ void loadConfig() {
     startupSlot = EEPROM.read(EE_STARTUP);
     regS6 = EEPROM.read(EE_S6); if (regS6 == 0xFF) regS6 = 0;
     regS7 = EEPROM.read(EE_S7); if (regS7 == 0xFF) regS7 = 3;
-    regS8 = EEPROM.read(EE_S8); if (regS8 == 0xFF) regS8 = 3;
+    regS8 = EEPROM.read(EE_S8);
+    // 0xFF raw = 255 = forever; only default to 3 if EEPROM magic invalid
+    if (regS8 == 0xFF && EEPROM.read(EE_MAGIC) != EEPROM_MAGIC) regS8 = 3;
     regS9  = EEPROM.read(EE_S9);  if (regS9  == 0xFF) regS9  = 3;
     regS10 = EEPROM.read(EE_S10); if (regS10 == 0xFF) regS10 = 1;
     regS11 = EEPROM.read(EE_S11); if (regS11 == 0xFF) regS11 = 5;
@@ -432,6 +448,7 @@ void loadConfig() {
     regS15 = EEPROM.read(EE_S15); if (regS15 == 0 || regS15 == 0xFF) regS15 = 50;
     regS16 = EEPROM.read(EE_S16); if (regS16 == 0 || regS16 == 0xFF) regS16 = 5;
     regS17 = EEPROM.read(EE_S17); if (regS17 == 0 || regS17 == 0xFF) regS17 = 20;
+    regS18 = EEPROM.read(EE_S18); if (regS18 > 1)                    regS18 = 0;
 }
 
 void saveConfig() {
@@ -466,6 +483,7 @@ void saveConfig() {
     EEPROM.update(EE_S15,      regS15);
     EEPROM.update(EE_S16,      regS16);
     EEPROM.update(EE_S17,      regS17);
+    EEPROM.update(EE_S18,      regS18);
     EEPROM.update(EE_MAGIC,    EEPROM_MAGIC);
 }
 
@@ -565,21 +583,22 @@ int8_t readRSSI() {
 }
 
 // ── Response helpers ──────────────────────────────────────────────────────────
-void sendOK()        { Serial.print(F("\r\nOK\r\n")); }
-void sendError()     { Serial.print(F("\r\nERROR\r\n")); }
-void sendNoCarrier() { Serial.print(F("\r\nNO CARRIER\r\n")); ledFlashER(); }
-void sendConnect()   { Serial.print(F("\r\nCONNECT\r\n")); }
-void sendRing()      { Serial.print(F("\r\nRING\r\n")); }
+void sendOK()        { if (!regS18) Serial.print(F("\r\nOK\r\n")); }
+void sendError()     { if (!regS18) Serial.print(F("\r\nERROR\r\n")); }
+void sendNoCarrier() { if (!regS18) Serial.print(F("\r\nNO CARRIER\r\n")); ledFlashER(); }
+void sendConnect()   { if (!regS18) Serial.print(F("\r\nCONNECT\r\n")); }
+void sendRing()      { if (!regS18) Serial.print(F("\r\nRING\r\n")); }
 
 // Print diagnostic/unsolicited text only when in CLI mode (not raw data mode).
 // In S_DATA the serial stream is raw — injecting text corrupts it.
 // S_CONNECTED = data mode but user has escaped via +++ so CLI is restored.
 inline bool inCliMode() { return state != S_DATA; }
-void cliPrint(const __FlashStringHelper *s)   { if (inCliMode()) Serial.print(s); }
-void cliPrintln(const __FlashStringHelper *s) { if (inCliMode()) Serial.println(s); }
-void cliPrint(uint8_t v)                      { if (inCliMode()) Serial.print(v); }
-void cliPrintln(uint8_t v)                    { if (inCliMode()) Serial.println(v); }
-void cliPrint(char c)                         { if (inCliMode()) Serial.print(c); }
+void cliPrint(const __FlashStringHelper *s)   { if (inCliMode() && !regS18) Serial.print(s); }
+void cliPrintln(const __FlashStringHelper *s) { if (inCliMode() && !regS18) Serial.println(s); }
+void cliPrint(uint8_t v)                      { if (inCliMode() && !regS18) Serial.print(v); }
+void cliPrintln(uint8_t v)                    { if (inCliMode() && !regS18) Serial.println(v); }
+void cliPrint(char c)                         { if (inCliMode() && !regS18) Serial.print(c); }
+void cliPrint(uint32_t v)                     { if (inCliMode() && !regS18) Serial.print(v); }
 
 
 // ── Packet transmit ───────────────────────────────────────────────────────────
@@ -683,6 +702,14 @@ void flushTxBuffer() {
                 } else if (pt == PKT_TEST_STOP) {
                     testStopFlag = true;   // signal test loop to exit
                     gotAck = true;         // exit retransmit loop cleanly
+                } else if (pt == PKT_DATA &&
+                           tmp[2] >= 9 &&
+                           tmp[DATA_OFFSET + 8] == TEST_FLAG_STOP &&
+                           readU32(tmp + DATA_OFFSET + 4) == TEST_MAGIC) {
+                    // Stop-flagged data packet from RX — set flag directly
+                    // instead of buffering in pendingPkt (which may be full).
+                    testStopFlag = true;
+                    gotAck = true;
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
@@ -987,6 +1014,7 @@ void factoryReset() {
     regS15 = 50;
     regS16 = 5;
     regS17 = 20;
+    regS18 = 0;
     txDropped = 0;
     rxDropped = 0;
 
@@ -1218,15 +1246,9 @@ void speedTestTX() {
             break;
         }
 
-        // Check for stop signal:
-        // - testStopFlag: PKT_TEST_STOP received inside flushTxBuffer (legacy)
-        // - pendingPkt: RX sent a data packet with TEST_FLAG_STOP
-        bool rxStopPkt = pendingPktReady &&
-                         pendingPkt[0] == PKT_DATA &&
-                         pendingPkt[2] >= (DATA_OFFSET + 9 - DATA_OFFSET) &&
-                         pendingPkt[DATA_OFFSET + 8] == TEST_FLAG_STOP &&
-                         readU32(pendingPkt + DATA_OFFSET + 4) == TEST_MAGIC;
-        if (testStopFlag || rxStopPkt) {
+        // Stop signal is detected inside flushTxBuffer's ACK wait loop
+        // and sets testStopFlag — catches it even when pendingPkt is full.
+        if (testStopFlag) {
             testStopFlag    = false;
             pendingPktReady = false;
             Serial.print(F("\r\n[TX] RX stopped the test\r\n"));
@@ -1256,7 +1278,7 @@ void speedTestTX() {
             Serial.print(F("[TX] t="));    Serial.print(elapsed);
             Serial.print(F("s  pkts="));   Serial.print(seqNum);
             Serial.print(F("  speed="));   Serial.print(speed);
-            Serial.print(F(" B/s  retx=")); Serial.print(retx);
+            Serial.print(F(" Payload B/s  retx=")); Serial.print(retx);
             Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
             Serial.print(F("  drop="));    Serial.println(txDropped - dropStart);
             lastStats = now;
@@ -1271,7 +1293,7 @@ tx_done:
         uint32_t retxPct = seqNum ? (retx * 100 / seqNum) : 0;
         Serial.print(F("\r\n[TX DONE] pkts=")); Serial.print(seqNum);
         Serial.print(F("  speed="));   Serial.print(speed);
-        Serial.print(F(" B/s  retx=")); Serial.print(retx);
+        Serial.print(F(" Payload B/s  retx=")); Serial.print(retx);
         Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
         Serial.print(F("  drop="));    Serial.println(txDropped - dropStart);
     }
@@ -1324,13 +1346,17 @@ void speedTestRX() {
 
         unsigned long now = millis();
 
-        // Drain pending packet
+        // Drain pending packet — check for stop flag first
         if (pendingPktReady) {
             pendingPktReady = false;
-            // Handle non-test packets normally; test packets handled below
-            if (pendingPkt[0] != PKT_DATA &&
-                pendingPkt[0] != PKT_TEST_START &&
-                pendingPkt[0] != PKT_TEST_STOP) {
+            if (pendingPkt[0] == PKT_DATA &&
+                pendingPkt[2] >= 9 &&
+                pendingPkt[DATA_OFFSET + 8] == TEST_FLAG_STOP &&
+                readU32(pendingPkt + DATA_OFFSET + 4) == TEST_MAGIC) {
+                Serial.print(F("\r\n[RX] TX stop flag received\r\n"));
+                goto rx_done;
+            } else if (pendingPkt[0] != PKT_TEST_START &&
+                       pendingPkt[0] != PKT_TEST_STOP) {
                 handleRadioPacket(pendingPkt);
             }
         }
@@ -1384,14 +1410,14 @@ void speedTestRX() {
                     // Count packet before checking stop flag
                     if (seq == expectedSeq) {
                         expectedSeq++;
-                        totalBytes += (TEST_PAY - 9);
+                        totalBytes += TEST_PAY;
                         recvPkts++;
                     } else if (seq > expectedSeq) {
                         uint32_t gap = seq - expectedSeq;
                         lostPkts   += gap;
                         if (gap > maxBurst) maxBurst = gap;
                         expectedSeq = seq + 1;
-                        totalBytes += (TEST_PAY - 9);
+                        totalBytes += TEST_PAY;
                         recvPkts++;
                     } else {
                         dupPkts++;
@@ -1416,7 +1442,7 @@ void speedTestRX() {
             Serial.print(F("[RX] t="));    Serial.print(elapsed);
             Serial.print(F("s  pkts="));   Serial.print(recvPkts);
             Serial.print(F("  speed="));   Serial.print(speed);
-            Serial.print(F(" B/s  PDR="));  Serial.print(pdr);
+            Serial.print(F(" Payload B/s  PDR="));  Serial.print(pdr);
             Serial.print(F("%  lost="));   Serial.print(lostPkts);
             Serial.print(F("  burst="));   Serial.print(maxBurst);
             Serial.print(F("  dup="));      Serial.print(dupPkts);
@@ -1433,7 +1459,7 @@ rx_done:
         uint32_t pdr   = total ? (recvPkts * 100 / total) : 100;
         Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(recvPkts);
         Serial.print(F("  speed="));   Serial.print(speed);
-        Serial.print(F(" B/s  PDR="));  Serial.print(pdr);
+        Serial.print(F(" Payload B/s  PDR="));  Serial.print(pdr);
         Serial.print(F("%  lost="));   Serial.print(lostPkts);
         Serial.print(F("  burst="));   Serial.print(maxBurst);
         Serial.print(F("  dup="));      Serial.print(dupPkts);
@@ -1447,6 +1473,82 @@ rx_done:
     kaPingAt     = millis() + (unsigned long)regS11 * 1000UL;
     kaLastPingMs = millis();
     kaMissed     = 0;
+    kaWaitingPong = false;
+    state = S_CONNECTED;
+    sendOK();
+}
+
+// ── Speed test echo ──────────────────────────────────────────────────────────
+// ATTEST-ECHO: reflects every received PKT_DATA packet back to sender.
+// Pair with ATTEST-TX on the other side. Any key stops. No stop signal
+// sent to remote — TX side just sees retx rise when echo stops replying.
+void speedTestEcho() {
+    if (state != S_CONNECTED) {
+        Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
+        return;
+    }
+    Serial.print(F("\r\nATTEST-ECHO: reflecting packets — any key to stop\r\n"));
+
+    uint32_t echoCount  = 0;
+    uint32_t dropStart  = rxDropped;
+    unsigned long echoStart = millis();
+    unsigned long lastStats = echoStart;
+
+    state = S_DATA;
+
+    while (true) {
+        if (Serial.available()) { Serial.read(); break; }
+
+        // Drain pending packet first
+        if (pendingPktReady) {
+            pendingPktReady = false;
+            handleRadioPacket(pendingPkt);
+        }
+
+        if (radio.available()) {
+            uint8_t pkt[PAYLOAD_SIZE];
+            radio.read(pkt, PAYLOAD_SIZE);
+
+            if (pkt[0] == PKT_DATA) {
+                uint8_t len = pkt[2];
+                // Push payload bytes into txBuf to echo back
+                for (uint8_t i = 0; i < len && i < MAX_DATA; i++) {
+                    txPush(pkt[DATA_OFFSET + i]);
+                }
+                // Send SWACK_YIELD — we have data to send (the echo)
+                swflowAckData(pkt[1]);
+                // Flush the echo immediately
+                flushTxBuffer();
+                echoCount++;
+            } else {
+                handleRadioPacket(pkt);
+            }
+        }
+
+        unsigned long now = millis();
+        if (now - lastStats >= TEST_STATS_MS) {
+            unsigned long elapsed = (now - echoStart) / 1000UL;
+            uint32_t speed = elapsed ? (echoCount * (TEST_PAY - 9) / elapsed) : 0;
+            Serial.print(F("[ECHO] t="));    Serial.print(elapsed);
+            Serial.print(F("s  pkts="));     Serial.print(echoCount);
+            Serial.print(F("  speed="));     Serial.print(speed);
+            Serial.print(F(" Payload B/s  drop=")); Serial.println(rxDropped - dropStart);
+            lastStats = now;
+        }
+    }
+
+    unsigned long elapsed = millis() - echoStart;
+    uint32_t speed = elapsed ? (echoCount * (TEST_PAY - 9) * 1000UL / elapsed) : 0;
+    Serial.print(F("\r\n[ECHO DONE] pkts=")); Serial.print(echoCount);
+    Serial.print(F("  speed="));   Serial.print(speed);
+    Serial.print(F(" Payload B/s  drop=")); Serial.println(rxDropped - dropStart);
+
+    // Reset KA timers and return to CLI
+    pendingPktReady = false;
+    clearBuffers();
+    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+    kaLastPingMs  = millis();
+    kaMissed      = 0;
     kaWaitingPong = false;
     state = S_CONNECTED;
     sendOK();
@@ -1532,6 +1634,10 @@ void printMac(const uint8_t mac[3]) {
 void processCommand(const char *cmd) {
     // Normalise: strip leading whitespace, upper-case copy
     while (*cmd == ' ') cmd++;
+    // S18 silent mode: ATS18= and AT&F are always allowed (escape hatch).
+    // All other commands still execute for state transitions — output
+    // helpers (sendOK, sendError, cliPrint etc.) are gated by regS18.
+    (void)0;  // output suppression handled in helpers
     char uc[CMD_BUF_SIZE];
     uint8_t i = 0;
     while (cmd[i] && i < CMD_BUF_SIZE - 1) {
@@ -1542,6 +1648,8 @@ void processCommand(const char *cmd) {
 
     // ── ATI ─────────────────────────────────────────────────────────────────
     if (strcmp(uc, "ATI") == 0) {
+        if (regS18) { sendOK(); return; }   // silent mode: suppress ATI output
+        if (regS18) { sendOK(); return; }   // silent mode: suppress ATI output
         Serial.print(F("\r\nnRF24L01 AT Modem "));
         Serial.println(F(MODEM_VERSION));
 
@@ -1584,7 +1692,9 @@ void processCommand(const char *cmd) {
 
         Serial.print(F("S6      : ")); Serial.print(regS6); Serial.println(F(" s  (pre-dial wait, 0=none)"));
         Serial.print(F("S7      : ")); Serial.print(regS7); Serial.println(F(" s  (carrier timeout)"));
-        Serial.print(F("S8      : ")); Serial.print(regS8); Serial.println(F("    (retry attempts)"));
+        Serial.print(F("S8      : "));
+        if (regS8 == 255) Serial.println(F("255  (retry forever)"));
+        else { Serial.print(regS8); Serial.println(F("    (retry attempts)")); }
         Serial.print(F("S9      : ")); Serial.print(regS9);  Serial.println(F(" s  (retry interval)"));
         Serial.print(F("S10     : ")); Serial.print(regS10); Serial.println(regS10 ? F("    (keep-alive ON)") : F("    (keep-alive OFF)"));
         Serial.print(F("S11     : ")); Serial.print(regS11); Serial.println(F(" s  (keep-alive interval)"));
@@ -1594,6 +1704,8 @@ void processCommand(const char *cmd) {
         Serial.print(F("S15     : ")); Serial.print(regS15); Serial.println(F(" ms (channel scan duration)"));
         Serial.print(F("S16     : ")); Serial.print(regS16); Serial.println(F(" ms (transparent TX idle flush)"));
         Serial.print(F("S17     : ")); Serial.print(regS17); Serial.println(F(" ms (spectrum scan dwell per channel)"));
+        Serial.print(F("S18     : ")); Serial.println(regS18 == 1 ? F("1 (silent mode ON)") : F("0 (normal output)"));
+        Serial.print(F("S18     : ")); Serial.println(regS18 == 1 ? F("1 (silent mode ON)") : F("0 (normal output)"));
         Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (serial->radio, host overflow)"));
         Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (radio->serial, radio overflow)"));
         if (txDropped || rxDropped) Serial.println(F("** DATA LOSS DETECTED — consider enabling XON/XOFF (ATS13=1) **"));
@@ -1873,6 +1985,7 @@ void processCommand(const char *cmd) {
             case 15: regPtr = &regS15; break;
             case 16: regPtr = &regS16; break;
             case 17: regPtr = &regS17; break;
+            case 18: regPtr = &regS18; break;
             default: sendError(); return;
         }
 
@@ -1998,9 +2111,10 @@ void processCommand(const char *cmd) {
         return;
     }
 
-    // ── ATTEST-TX / ATTEST-RX ───────────────────────────────────────────────
-    if (strcmp(uc, "ATTEST-TX") == 0) { speedTestTX(); return; }
-    if (strcmp(uc, "ATTEST-RX") == 0) { speedTestRX(); return; }
+    // ── ATTEST-TX / ATTEST-RX / ATTEST-ECHO ─────────────────────────────────
+    if (strcmp(uc, "ATTEST-TX") == 0)   { speedTestTX();   return; }
+    if (strcmp(uc, "ATTEST-RX") == 0)   { speedTestRX();   return; }
+    if (strcmp(uc, "ATTEST-ECHO") == 0) { speedTestEcho(); return; }
 
     // ── ATPING ──────────────────────────────────────────────────────────────
     // Only available from S_IDLE — no active or pending connection.
@@ -2013,6 +2127,15 @@ void processCommand(const char *cmd) {
         if (!parseMac(uc + 6, mac)) { sendError(); return; }
         atPing(mac);
         return;
+    }
+
+    // ── ATREBOOT ────────────────────────────────────────────────────────────
+    if (strcmp(uc, "ATREBOOT") == 0) {
+        sendOK();
+        Serial.flush();
+        delay(100);
+        wdt_enable(WDTO_15MS);
+        while (true) {}
     }
 
     // ── AT (bare) ───────────────────────────────────────────────────────────
@@ -2128,10 +2251,12 @@ void setup() {
     applyRadioConfig();
     openListenPipes();
 
-    Serial.print(F("\r\nnRF24L01 AT Modem "));
-    Serial.print(F(MODEM_VERSION));
-    Serial.println(F(" ready."));
-    Serial.println(F("Type ATI for status."));
+    if (!regS18) {
+        Serial.print(F("\r\nnRF24L01 AT Modem "));
+        Serial.print(F(MODEM_VERSION));
+        Serial.println(F(" ready."));
+        Serial.println(F("Type ATI for status."));
+    }
 
     if (startupSlot < DIAL_SLOTS && dialStr[startupSlot][0] != '\0') {
         autoDial   = true;
@@ -2228,15 +2353,17 @@ void loop() {
             // Carrier not received within S7 seconds.
             state = S_IDLE;
             connectStart = 0;
-            if (regS8 > 0 && dialRetryCount < regS8 && lastDialStr[0] != '\0') {
-                // Schedule a retry after S9 seconds.
+            // S8=255 = retry forever
+            bool retryForever = (regS8 == 255);
+            if (regS8 > 0 && (retryForever || dialRetryCount < regS8)
+                && lastDialStr[0] != '\0') {
                 dialRetryCount++;
                 dialRetrying = true;
                 dialRetryAt  = now + (unsigned long)regS9 * 1000UL;
                 cliPrint(F("NO CARRIER - retry "));
                 cliPrint(dialRetryCount);
-                cliPrint(F("/"));
-                cliPrintln(regS8);
+                if (retryForever) cliPrintln(F("/forever"));
+                else { cliPrint(F("/")); cliPrintln(regS8); }
                 ledFlashER();
             } else {
                 // Exhausted retries (or S8=0).
@@ -2256,9 +2383,8 @@ void loop() {
         dialRetrying = false;
         cliPrint(F("Redialling (attempt "));
         cliPrint(dialRetryCount);
-        cliPrint(F("/"));
-        cliPrint(regS8);
-        cliPrintln(F(")..."));
+        if (regS8 == 255) cliPrintln(F("/forever)..."));
+        else { cliPrint(F("/")); cliPrint(regS8); cliPrintln(F(")...")); }
         processCommand(lastDialStr);
     }
 
@@ -2316,7 +2442,9 @@ void loop() {
     // This block only handles timeout: if no PKT_CONN arrives within the
     // caller's full retry window, silently return to IDLE.
     if (state == S_RINGING && lastConnMs != 0) {
-        unsigned long ringTimeoutMs =
+        unsigned long ringTimeoutMs;
+        if (regS8 == 255) ringTimeoutMs = 3600000UL;  // 1 hour ~= forever
+        else ringTimeoutMs =
             (unsigned long)(regS8 + 1) * (unsigned long)regS7 * 1000UL
             + (unsigned long)regS8     * (unsigned long)regS9 * 1000UL
             + 2000UL;
