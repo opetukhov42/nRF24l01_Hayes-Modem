@@ -628,6 +628,13 @@ bool sendControlPacket(uint8_t type) {
     return sendPacket(type, nullptr, 0);
 }
 
+// ── Speed test constants (defined here so flushTxBuffer can reference them) ───
+#define TEST_MAGIC     0xDEADBEEFUL
+#define TEST_PAY       MAX_DATA       // 29 bytes per packet
+#define TEST_STATS_MS  1000           // print stats every 1 s
+#define TEST_FLAG_OK   0x00           // payload[8]: normal packet
+#define TEST_FLAG_STOP 0xFF           // payload[8]: stop signal embedded in data
+
 // ── Send buffered TX data over the air ───────────────────────────────────────
 // SWFLOW: pure stop-and-wait. Send one packet, wait SW_ACK_WAIT_MS for SWACK.
 // Retransmit up to SW_RETX_MAX times on no-reply.
@@ -1198,11 +1205,7 @@ bool channelIsBusy() {
 //   [4..7]  uint32_t magic 0xDEADBEEF  ← RX arms on first packet with this magic
 //   [8..28] 0xAA fill
 //
-#define TEST_MAGIC     0xDEADBEEFUL
-#define TEST_PAY       MAX_DATA       // 29 bytes per packet
-#define TEST_STATS_MS  1000           // print stats every 1 s
-#define TEST_FLAG_OK   0x00           // payload[8]: normal packet
-#define TEST_FLAG_STOP 0xFF           // payload[8]: stop signal embedded in data
+// TEST_MAGIC / TEST_PAY / TEST_FLAG_* defined near top of file (before flushTxBuffer)
 
 // Write a uint32 little-endian into a buffer
 static void writeU32(uint8_t *p, uint32_t v) {
