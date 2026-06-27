@@ -10,78 +10,152 @@ Current firmware version: **v1.61.0**
 
 SAMLE SESSION OUTPUT:
 
+
+
 nRF24L01 AT Modem v1.61.0 ready.
+
 Type ATI for status.
+
 ati
+
 nRF24L01 AT Modem v1.61.0
+
 Radio   : OK
+
 Baud    : 115200
+
 State   : IDLE
+
 Flow mode: 2 (SWFLOW - software flow control)
+
 Channel : 97
+
 Speed   : 1 Mbps
+
 Own MAC : 000001
+
 Rem MAC : 000002
+
 RSSI    : -90 dBm (approx)
+
 S6      : 0 s  (pre-dial wait, 0=none)
+
 S7      : 3 s  (carrier timeout)
+
 S8      : 3    (retry attempts)
+
 S9      : 3 s  (retry interval)
+
 S10     : 1    (keep-alive ON)
+
 S11     : 5 s  (keep-alive interval)
+
 S12     : 3    (missed pongs before drop)
+
 S13     : 1 (XON/XOFF enabled)
+
 S14     : 1 (busy detect ON)
+
 S15     : 50 ms (channel scan duration)
+
 S16     : 5 ms (transparent TX idle flush)
+
 S17     : 20 ms (spectrum scan dwell per channel)
+
 S18     : 0 (normal output)
+
 S18     : 0 (normal output)
+
 TX drop : 0 bytes (serial->radio, host overflow)
+
 RX drop : 0 bytes (radio->serial, radio overflow)
+
 Startup : none
+
 &Z0     : (empty)
+
 &Z1     : (empty)
+
 &Z2     : (empty)
+
 &Z3     : (empty)
 
+
+
 OK
+
+
 
 PING from 000002
+
 atd000002
+
 CONNECT
+
 testtesttesttest111222333444555666+++
 
+
+
 OK
+
 attest-tx
+
 ATTEST-TX: sending — any key to stop
+
 [TX] t=1s  pkts=434  speed=12586 Payload B/s  retx=0 (0%)  drop=0
+
 [TX] t=2s  pkts=863  speed=12513 Payload B/s  retx=2 (0%)  drop=0
+
 [TX] t=3s  pkts=1297  speed=12537 Payload B/s  retx=2 (0%)  drop=0
+
 ***SKIP***
+
 [TX] t=25s  pkts=10413  speed=12079 Payload B/s  retx=151 (1%)  drop=0
+
 [TX] t=26s  pkts=10840  speed=12090 Payload B/s  retx=151 (1%)  drop=0
+
 [TX] t=27s  pkts=11267  speed=12101 Payload B/s  retx=151 (1%)  drop=0
+
+
 
 [TX DONE] pkts=11683  speed=12099 Payload B/s  retx=151 (1%)  drop=0
 
+
+
 OK
+
 attest-rx
+
 ATTEST-RX: waiting for test stream — any key to stop
+
 [RX] armed on seq=0
+
 [RX] t=1s  pkts=435  speed=12615 Payload B/s  PDR=99%  lost=1  burst=1  dup=0  drop=0
+
 [RX] t=2s  pkts=857  speed=12426 Payload B/s  PDR=99%  lost=1  burst=1  dup=4  drop=0
+
 [RX] t=3s  pkts=1253  speed=12112 Payload B/s  PDR=99%  lost=1  burst=1  dup=11  drop=0
+
 ***SKIP***
+
 [RX] t=15s  pkts=6396  speed=12365 Payload B/s  PDR=99%  lost=1  burst=1  dup=17  drop=0
+
 [RX] t=16s  pkts=6830  speed=12379 Payload B/s  PDR=99%  lost=1  burst=1  dup=17  drop=0
+
 [RX] t=17s  pkts=7264  speed=12391 Payload B/s  PDR=99%  lost=1  burst=1  dup=17  drop=0
+
+
 
 [RX DONE] pkts=7611  speed=12395 Payload B/s  PDR=99%  lost=1  burst=1  dup=17  drop=0
 
+
+
 OK
+
 ath
+
 NO CARRIER
+
 
 ## Features
 
