@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.81.0"
+#define MODEM_VERSION "v1.84.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -242,6 +242,7 @@ bool          kaWaitingPong = false; // true between sending PING and receiving 
 unsigned long kaLastPingMs  = 0;     // answerer: millis() of last received PKT_PING (0=none yet)
 unsigned long kaLastSentMs  = 0;     // millis() of last PKT_PING sent (initiator)
 unsigned long kaLastRcvdMs  = 0;     // millis() of last PKT_PING received (answerer)
+bool          pendingPong    = false; // send PKT_PONG via yield path on next flushTxBuffer
 
 // Dial retry state (managed by the connect-timeout block in loop())
 uint32_t dialRetryCount  = 0;          // retries fired so far (uint32 for forever mode)
@@ -694,6 +695,13 @@ void flushTxBuffer() {
     if (radioXoffRecv) return;
 
     // Cooperative yield: remote requested TX window.
+    // Pending pong: send via yield mechanism before normal data
+    if (pendingPong && !yieldToRemote) {
+        pendingPong = false;
+        sendControlPacket(PKT_PONG);
+        return;
+    }
+
     if (yieldToRemote) {
         yieldToRemote = false;
         unsigned long yieldEnd = millis() + SW_ACK_WAIT_MS * 2;
@@ -865,6 +873,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaPingAt      = 0;
                 kaLastPingMs  = 0;
                 yieldToRemote  = false;
+                pendingPong    = false;
                 swLastPktValid = false;
                 rxLastSeq      = 0xFF;
                 radioXoffRecv  = false;
@@ -917,9 +926,12 @@ void handleRadioPacket(const uint8_t *pkt) {
         case PKT_PING:
             if (state == S_DATA || state == S_CONNECTED) {
                 kaLastRcvdMs = millis();
-                sendControlPacket(PKT_PONG);
                 if (regS10 && !kaInitiator)
                     kaLastPingMs = millis();
+                // Queue pong via yield path — guarantees delivery under
+                // heavy data flooding without timing races.
+                pendingPong   = true;
+                yieldToRemote = true;  // request TX window for pong
             }
             break;
 
@@ -1599,6 +1611,7 @@ void processCommand(const char *cmd) {
         kaPingAt       = 0;
         kaLastPingMs   = 0;
         yieldToRemote  = false;
+        pendingPong    = false;
         swLastPktValid = false;
         rxLastSeq      = 0xFF;
         if (state == S_RINGING) {
@@ -2367,12 +2380,15 @@ void loop() {
             if (kaLastRcvdMs && (millis() - kaLastRcvdMs) < TEST_STATS_MS)
                 Serial.print(F("rcvd "));
             if (!kaInitiator) {
-                unsigned long kaAge = millis() - kaLastPingMs;
-                unsigned long kaWin = (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
-                if (kaLastPingMs == 0 || kaAge > kaWin)
-                    Serial.println(F("timeout!"));
-                else
-                    Serial.println(F("OK"));
+                if (kaLastPingMs == 0) {
+                    Serial.println(F("no ping yet"));
+                } else {
+                    unsigned long kaAgeSec = (millis() - kaLastPingMs) / 1000UL;
+                    unsigned long kaWinSec = (unsigned long)regS11 * (unsigned long)regS12;
+                    if (kaAgeSec >= kaWinSec) Serial.println(F("timeout!"));
+                    else if (kaAgeSec == 0)   Serial.println(F("OK"));
+                    else { Serial.print(kaAgeSec); Serial.print(F("s/")); Serial.print(kaWinSec); Serial.println(F("s")); }
+                }
             } else {
                 if (kaMissed == 0 && !kaWaitingPong) Serial.println(F("OK"));
                 else if (kaMissed == 0) Serial.println(F("wait"));
@@ -2401,9 +2417,15 @@ void loop() {
             if (kaLastRcvdMs && (millis() - kaLastRcvdMs) < TEST_STATS_MS) Serial.print(F("rcvd "));
             if (kaMissed == 0 && !kaWaitingPong && kaInitiator) Serial.println(F("OK"));
             else if (!kaInitiator) {
-                unsigned long kaAge = millis() - kaLastPingMs;
-                unsigned long kaWin = (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
-                Serial.println((kaLastPingMs == 0 || kaAge > kaWin) ? F("timeout!") : F("OK"));
+                if (kaLastPingMs == 0) {
+                    Serial.println(F("no ping yet"));
+                } else {
+                    unsigned long kaAgeSec = (millis() - kaLastPingMs) / 1000UL;
+                    unsigned long kaWinSec = (unsigned long)regS11 * (unsigned long)regS12;
+                    if (kaAgeSec >= kaWinSec) Serial.println(F("timeout!"));
+                    else if (kaAgeSec == 0)   Serial.println(F("OK"));
+                    else { Serial.print(kaAgeSec); Serial.print(F("s/")); Serial.print(kaWinSec); Serial.println(F("s")); }
+                }
             } else if (kaMissed == 0) Serial.println(F("wait"));
             else { Serial.print(F("miss ")); Serial.print(kaMissed); Serial.print(F("/")); Serial.println(regS12); }
             testEchoICount = 0;
