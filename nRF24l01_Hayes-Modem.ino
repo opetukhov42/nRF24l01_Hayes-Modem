@@ -702,9 +702,7 @@ bool sendDirectCtrl(uint8_t type) {
 }
 
 static void errMustBeConnected() {
-    Serial.print(F("
-ERROR: must be connected (use ATD then +++ first)
-"));
+    Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
 }
 
 // ── Speed test constants ──────────────────────────────────────────────────────
