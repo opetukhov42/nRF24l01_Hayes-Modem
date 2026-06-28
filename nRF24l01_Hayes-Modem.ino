@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.77.0"
+#define MODEM_VERSION "v1.78.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -342,6 +342,7 @@ uint8_t  rxLastSeq   = 0xFF;    // last accepted PKT_DATA seq (0xFF = none yet)
 // ── Speed test mode (non-blocking, runs inside loop()) ───────────────────────
 bool     testTxActive   = false;
 bool     testRxActive   = false;
+bool     testEchoActive = false;
 uint32_t testTxBytes    = 0;
 uint32_t testTxPkts     = 0;
 uint32_t testRxBytes    = 0;
@@ -350,8 +351,11 @@ uint32_t testIBytes     = 0;    // bytes in current 1-second interval
 uint32_t testIPkts      = 0;    // packets in current 1-second interval
 uint32_t testIRetxBase  = 0;    // retx baseline for current interval
 uint32_t testTxRetxBase = 0;    // retx baseline for whole TX test
-uint32_t testTxDropBase = 0;
-uint32_t testRxDropBase = 0;
+uint32_t testTxDropBase  = 0;
+uint32_t testRxDropBase  = 0;
+uint32_t testEchoCount   = 0;
+uint32_t testEchoICount  = 0;
+uint32_t testEchoDropBase = 0;
 uint32_t testPktCounter = 0;    // incrementing counter for buildTestPacket
 unsigned long testStart     = 0;
 unsigned long testLastStats = 0;
@@ -609,9 +613,10 @@ void sendNoCarrier() {
     if (!regS18) Serial.print(F("\r\nNO CARRIER\r\n"));
     ledFlashER();
     // Stop any running test — connection is gone
-    if (testTxActive || testRxActive) {
-        testTxActive = false;
-        testRxActive = false;
+    if (testTxActive || testRxActive || testEchoActive) {
+        testTxActive   = false;
+        testRxActive   = false;
+        testEchoActive = false;
         Serial.print(F("\r\n[TEST STOPPED - NO CARRIER]\r\n"));
     }
 }
@@ -1308,71 +1313,15 @@ void speedTestEcho() {
         Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
         return;
     }
-    Serial.print(F("\r\nATTEST-ECHO: reflecting packets — any key to stop\r\n"));
-
-    uint32_t echoCount  = 0;
-    uint32_t iCount     = 0;   // packets this interval
-    uint32_t dropStart  = rxDropped;
-    unsigned long echoStart = millis();
-    unsigned long lastStats = echoStart;
-
-    state = S_DATA;
-
-    while (true) {
-        if (Serial.available()) { Serial.read(); break; }
-
-        // Drain pending packet first
-        if (pendingPktReady) {
-            pendingPktReady = false;
-            handleRadioPacket(pendingPkt);
-        }
-
-        if (radio.available()) {
-            uint8_t pkt[PAYLOAD_SIZE];
-            radio.read(pkt, PAYLOAD_SIZE);
-
-            if (pkt[0] == PKT_DATA) {
-                uint8_t len = pkt[2];
-                // Push payload bytes into txBuf to echo back
-                for (uint8_t i = 0; i < len && i < MAX_DATA; i++) {
-                    txPush(pkt[DATA_OFFSET + i]);
-                }
-                // Send SWACK_YIELD — we have data to send (the echo)
-                swflowAckData(pkt[1]);
-                // Flush the echo immediately
-                flushTxBuffer();
-                echoCount++;
-                iCount++;
-            } else {
-                handleRadioPacket(pkt);
-            }
-        }
-
-        unsigned long now = millis();
-        if (now - lastStats >= TEST_STATS_MS) {
-            unsigned long elapsed = (now - echoStart) / 1000UL;
-            uint32_t speed = iCount * MAX_DATA;   // bytes in last second
-            Serial.print(F("[ECHO] t="));    Serial.print(elapsed);
-            Serial.print(F("s  pkts="));     Serial.print(echoCount);
-            Serial.print(F("  speed="));     Serial.print(speed);
-            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - dropStart);
-            iCount    = 0;
-            lastStats = now;
-        }
-    }
-
-    unsigned long elapsed = millis() - echoStart;
-    uint32_t speed = elapsed ? (echoCount * MAX_DATA * 1000UL / elapsed) : 0;
-    Serial.print(F("\r\n[ECHO DONE] pkts=")); Serial.print(echoCount);
-    Serial.print(F("  speed="));   Serial.print(speed);
-    Serial.print(F(" Payload B/s  drop=")); Serial.println(rxDropped - dropStart);
-
-    // Reset KA timers and return to CLI
-    pendingPktReady = false;
-    clearBuffers();
-    state = S_CONNECTED;
+    if (state == S_CONNECTED) state = S_DATA;
+    testEchoActive    = true;
+    testEchoCount     = 0;
+    testEchoICount    = 0;
+    testEchoDropBase  = rxDropped;
+    testStart         = millis();
+    testLastStats     = testStart;
     kaResetWindow();
-    sendOK();
+    Serial.print(F("\r\nATTEST-ECHO: reflecting packets — any key to stop\r\n"));
 }
 
 // ── Diagnostic ping ──────────────────────────────────────────────────────────
@@ -2165,17 +2114,26 @@ void loop() {
     // ── 2. Read from serial (or feed/intercept for active tests) ─────────────
     // RX test keypress must be caught here — before normal serial processing
     // would consume and discard the byte as data, making stop unreliable.
-    if (testRxActive && Serial.available()) {
+    if ((testRxActive || testEchoActive) && Serial.available()) {
         Serial.read();   // consume the keypress
-        while (rxAvail() > 0) { rxPop(); testRxBytes++; }
-        unsigned long elapsed = millis() - testStart;
-        uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
-        // testRxPkts counted directly at radio receive
-        Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
-        Serial.print(F("  bytes="));  Serial.print(testRxBytes);
-        Serial.print(F("  speed="));  Serial.print(speed);
-        Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
-        testRxActive = false;
+        if (testRxActive) {
+            while (rxAvail() > 0) { rxPop(); testRxBytes++; }
+            unsigned long elapsed = millis() - testStart;
+            uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
+            Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
+            Serial.print(F("  bytes="));  Serial.print(testRxBytes);
+            Serial.print(F("  speed="));  Serial.print(speed);
+            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
+            testRxActive = false;
+        } else {
+            unsigned long elapsed = millis() - testStart;
+            uint32_t speed = elapsed ? (testEchoCount * MAX_DATA * 1000UL / elapsed) : 0;
+            Serial.print(F("\r\n[ECHO DONE] pkts=")); Serial.print(testEchoCount);
+            Serial.print(F("  speed=")); Serial.print(speed);
+            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testEchoDropBase);
+            testEchoActive = false;
+            clearBuffers();
+        }
         state = S_CONNECTED;
         kaResetWindow();
         sendOK();
@@ -2363,7 +2321,8 @@ void loop() {
     if (radio.available()) {
         uint8_t pkt[PAYLOAD_SIZE];
         radio.read(pkt, PAYLOAD_SIZE);
-        if (testRxActive && pkt[0] == PKT_DATA) testRxPkts++;
+        if (testRxActive  && pkt[0] == PKT_DATA) testRxPkts++;
+        if (testEchoActive && pkt[0] == PKT_DATA) { testEchoCount++; testEchoICount++; }
         if (flowMode == 0 && (state == S_DATA || state == S_CONNECTED)) {
             ledFlashRD();
             for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
@@ -2394,6 +2353,24 @@ void loop() {
             Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
             testIBytes    = 0;
             testLastStats = tnow;
+        }
+    } else if (testEchoActive) {
+        // Echo mode: reflect received bytes back via txBuf
+        while (rxAvail() > 0) {
+            int b = rxPop();
+            if (b >= 0) txPush((uint8_t)b);
+        }
+        // Periodic stats
+        unsigned long tnow = millis();
+        if (tnow - testLastStats >= TEST_STATS_MS) {
+            unsigned long elapsed = (tnow - testStart) / 1000UL;
+            uint32_t speed = testEchoICount * MAX_DATA;
+            Serial.print(F("[ECHO] t="));   Serial.print(elapsed);
+            Serial.print(F("s  pkts="));    Serial.print(testEchoCount);
+            Serial.print(F("  speed="));    Serial.print(speed);
+            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testEchoDropBase);
+            testEchoICount = 0;
+            testLastStats  = tnow;
         }
     } else if (testTxActive) {
         // TX test active — discard inbound data (e.g. echo) silently
