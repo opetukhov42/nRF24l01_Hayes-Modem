@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.117.0"
+#define MODEM_VERSION "v1.118.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -758,6 +758,14 @@ void flushTxBuffer() {
                     } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
                         // Stale SWACK for a different packet — process but don't confirm
                         handleRadioPacket(tmp);
+                    } else if (pt == PKT_DATA || pt == PKT_PING || pt == PKT_PONG ||
+                               pt == PKT_XON  || pt == PKT_XOFF) {
+                        if (pt == PKT_DATA) {
+                            if (testRxActive)   testRxPkts++;
+                            if (testEchoActive) { testEchoCount++; testEchoICount++; }
+                            if (testTxRxActive) testTxRxRxPkts++;
+                        }
+                        handleRadioPacket(tmp);
                     } else if (!pendingPktReady) {
                         memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                         pendingPktReady = true;
@@ -789,6 +797,11 @@ void flushTxBuffer() {
                 if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD ||
                     pt == PKT_DATA  || pt == PKT_PING || pt == PKT_PONG ||
                     pt == PKT_XON   || pt == PKT_XOFF) {
+                    if (pt == PKT_DATA) {
+                        if (testRxActive)   testRxPkts++;
+                        if (testEchoActive) { testEchoCount++; testEchoICount++; }
+                        if (testTxRxActive) testTxRxRxPkts++;
+                    }
                     handleRadioPacket(tmp);
                     gotPkt = true;
                 } else if (!pendingPktReady) {
@@ -848,6 +861,11 @@ void flushTxBuffer() {
                     handleRadioPacket(tmp);
                 } else if (pt == PKT_DATA  || pt == PKT_PING || pt == PKT_PONG ||
                            pt == PKT_XON   || pt == PKT_XOFF) {
+                    if (pt == PKT_DATA) {
+                        if (testRxActive)   testRxPkts++;
+                        if (testEchoActive) { testEchoCount++; testEchoICount++; }
+                        if (testTxRxActive) testTxRxRxPkts++;
+                    }
                     handleRadioPacket(tmp);
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
@@ -1233,6 +1251,10 @@ void factoryReset() {
 //   0123456789012345678901234...  (units)
 
 // SPECTRUM_DWELL_MS replaced by S17 register (regS17) — see ATSn handler
+
+static void printSpectrumRuler() {
+    Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
+}
 
 void spectrumScan() {
     if (state != S_IDLE && state != S_CONNECTED) {
