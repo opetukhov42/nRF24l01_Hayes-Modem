@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.118.0"
+#define MODEM_VERSION "v1.119.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -738,6 +738,7 @@ void flushTxBuffer() {
         ctrlPktReady = false;
         if (ctrlPkt[0] == PKT_PING) kaLastSentMs = millis();
         bool gotAck2 = false;
+        bool gotYield2 = false;
         for (uint8_t attempt = 0; attempt <= SW_RETX_MAX; attempt++) {
             if (attempt > 0) swRetxCount++;
             openWritePipe(remoteMac);
@@ -752,11 +753,10 @@ void flushTxBuffer() {
                     uint8_t pt = tmp[0];
                     if ((pt == PKT_SWACK || pt == PKT_SWACK_YIELD)
                         && tmp[DATA_OFFSET] == ctrlPkt[1]) {
-                        // SWACK is specifically for our ctrl packet
                         handleRadioPacket(tmp);
                         gotAck2 = true;
+                        if (pt == PKT_SWACK_YIELD) gotYield2 = true;
                     } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
-                        // Stale SWACK for a different packet — process but don't confirm
                         handleRadioPacket(tmp);
                     } else if (pt == PKT_DATA || pt == PKT_PING || pt == PKT_PONG ||
                                pt == PKT_XON  || pt == PKT_XOFF) {
@@ -774,6 +774,11 @@ void flushTxBuffer() {
                 if (gotAck2) break;
             }
             if (gotAck2) break;
+        }
+        // Remote sent SWACK_YIELD — it has a ctrl packet to send (e.g. pong).
+        // Enter yield wait so it can deliver into our RX window.
+        if (gotYield2) {
+            yieldToRemote = true;   // handled by normal yield path below
         }
         return;
     }
@@ -1027,8 +1032,8 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaLastRcvdMs = millis();
                 if (regS10 && !kaInitiator)
                     kaLastPingMs = millis();
-                swflowAckData(pkt[1]);   // ACK the ping; YIELD if we have ctrl/data
-                queueCtrl(PKT_PONG);     // reliable pong delivery
+                queueCtrl(PKT_PONG);     // queue first so swflowAckData yields
+                swflowAckData(pkt[1]);   // ACK ping with SWACK_YIELD (ctrlPktReady=true)
             }
             break;
 
