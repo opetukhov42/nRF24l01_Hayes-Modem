@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.78.0"
+#define MODEM_VERSION "v1.81.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -240,6 +240,8 @@ unsigned long kaPingAt      = 0;     // millis() when next PKT_PING is due
 uint8_t       kaMissed      = 0;     // consecutive unanswered pings (initiator only)
 bool          kaWaitingPong = false; // true between sending PING and receiving PONG
 unsigned long kaLastPingMs  = 0;     // answerer: millis() of last received PKT_PING (0=none yet)
+unsigned long kaLastSentMs  = 0;     // millis() of last PKT_PING sent (initiator)
+unsigned long kaLastRcvdMs  = 0;     // millis() of last PKT_PING received (answerer)
 
 // Dial retry state (managed by the connect-timeout block in loop())
 uint32_t dialRetryCount  = 0;          // retries fired so far (uint32 for forever mode)
@@ -696,7 +698,7 @@ void flushTxBuffer() {
         yieldToRemote = false;
         unsigned long yieldEnd = millis() + SW_ACK_WAIT_MS * 2;
         while (millis() < yieldEnd) {
-            if (radio.available()) {
+            while (radio.available()) {
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
@@ -708,7 +710,6 @@ void flushTxBuffer() {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
                 }
-                break;
             }
         }
         return;
@@ -746,7 +747,7 @@ void flushTxBuffer() {
 
         unsigned long waitEnd = millis() + SW_ACK_WAIT_MS;
         while (millis() < waitEnd) {
-            if (radio.available()) {
+            while (radio.available()) {
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
@@ -755,15 +756,14 @@ void flushTxBuffer() {
                     gotAck = true;
                 } else if (pt == PKT_XON  || pt == PKT_XOFF ||
                            pt == PKT_PING || pt == PKT_PONG) {
-                    // Handle KA packets immediately — don't defer to pendingPkt
-                    // which may be full, causing silent discard and KA misses.
+                    // Handle KA and flow control immediately
                     handleRadioPacket(tmp);
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
                 }
-                break;
             }
+            if (gotAck) break;
         }
         if (gotAck) break;
     }
@@ -915,9 +915,8 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_PING:
-            // Only reply when we have an active connection — replying from
-            // S_IDLE would keep the remote's KA alive after we've disconnected.
             if (state == S_DATA || state == S_CONNECTED) {
+                kaLastRcvdMs = millis();
                 sendControlPacket(PKT_PONG);
                 if (regS10 && !kaInitiator)
                     kaLastPingMs = millis();
@@ -2192,7 +2191,20 @@ void loop() {
                 Serial.print(F("  speed="));   Serial.print(testIBytes);
                 Serial.print(F(" B/s  retx=")); Serial.print(iRetx);
                 Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
-                Serial.print(F("  drop="));    Serial.println(txDropped - testTxDropBase);
+                Serial.print(F("  drop="));    Serial.print(txDropped - testTxDropBase);
+                // KA: sent this second?
+                Serial.print(F("  KA:"));
+                if (kaLastSentMs && (millis() - kaLastSentMs) < TEST_STATS_MS)
+                    Serial.print(F("sent "));
+                // Watchdog state
+                if (kaMissed == 0 && !kaWaitingPong)
+                    Serial.println(F("OK"));
+                else if (kaMissed == 0)
+                    Serial.println(F("wait"));
+                else {
+                    Serial.print(F("miss ")); Serial.print(kaMissed);
+                    Serial.print(F("/")); Serial.println(regS12);
+                }
                 testIBytes    = 0;
                 testIPkts     = 0;
                 testIRetxBase = swRetxCount;
@@ -2350,7 +2362,22 @@ void loop() {
             Serial.print(F("[RX] t="));    Serial.print(elapsed);
             Serial.print(F("s  pkts="));   Serial.print(testRxPkts);
             Serial.print(F("  speed="));   Serial.print(testIBytes);
-            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
+            Serial.print(F(" B/s  drop=")); Serial.print(rxDropped - testRxDropBase);
+            Serial.print(F("  KA:"));
+            if (kaLastRcvdMs && (millis() - kaLastRcvdMs) < TEST_STATS_MS)
+                Serial.print(F("rcvd "));
+            if (!kaInitiator) {
+                unsigned long kaAge = millis() - kaLastPingMs;
+                unsigned long kaWin = (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
+                if (kaLastPingMs == 0 || kaAge > kaWin)
+                    Serial.println(F("timeout!"));
+                else
+                    Serial.println(F("OK"));
+            } else {
+                if (kaMissed == 0 && !kaWaitingPong) Serial.println(F("OK"));
+                else if (kaMissed == 0) Serial.println(F("wait"));
+                else { Serial.print(F("miss ")); Serial.print(kaMissed); Serial.print(F("/")); Serial.println(regS12); }
+            }
             testIBytes    = 0;
             testLastStats = tnow;
         }
@@ -2368,7 +2395,17 @@ void loop() {
             Serial.print(F("[ECHO] t="));   Serial.print(elapsed);
             Serial.print(F("s  pkts="));    Serial.print(testEchoCount);
             Serial.print(F("  speed="));    Serial.print(speed);
-            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testEchoDropBase);
+            Serial.print(F(" B/s  drop=")); Serial.print(rxDropped - testEchoDropBase);
+            Serial.print(F("  KA:"));
+            if (kaLastSentMs && (millis() - kaLastSentMs) < TEST_STATS_MS) Serial.print(F("sent "));
+            if (kaLastRcvdMs && (millis() - kaLastRcvdMs) < TEST_STATS_MS) Serial.print(F("rcvd "));
+            if (kaMissed == 0 && !kaWaitingPong && kaInitiator) Serial.println(F("OK"));
+            else if (!kaInitiator) {
+                unsigned long kaAge = millis() - kaLastPingMs;
+                unsigned long kaWin = (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
+                Serial.println((kaLastPingMs == 0 || kaAge > kaWin) ? F("timeout!") : F("OK"));
+            } else if (kaMissed == 0) Serial.println(F("wait"));
+            else { Serial.print(F("miss ")); Serial.print(kaMissed); Serial.print(F("/")); Serial.println(regS12); }
             testEchoICount = 0;
             testLastStats  = tnow;
         }
@@ -2438,34 +2475,14 @@ void loop() {
                     sendNoCarrier();
                 } else {
                     sendControlPacket(PKT_PING);
+                    kaLastSentMs = millis();
                     kaPingAt = now + (unsigned long)regS11 * 1000UL;
-                    // Brief listen window for pong
-                    unsigned long pongWait = millis() + SW_ACK_WAIT_MS * 4;
-                    while (millis() < pongWait) {
-                        if (radio.available()) {
-                            uint8_t tmp[PAYLOAD_SIZE];
-                            radio.read(tmp, PAYLOAD_SIZE);
-                            handleRadioPacket(tmp);
-                            if (!kaWaitingPong) break;
-                        }
-                    }
                 }
             } else {
                 sendControlPacket(PKT_PING);
+                kaLastSentMs  = millis();
                 kaWaitingPong = true;
                 kaPingAt      = now + (unsigned long)regS11 * 1000UL;
-                // Brief listen window for pong — radio is in RX after
-                // sendControlPacket but flushTxBuffer will immediately
-                // switch to TX again; give pong a chance to arrive.
-                unsigned long pongWait = millis() + SW_ACK_WAIT_MS * 4;
-                while (millis() < pongWait) {
-                    if (radio.available()) {
-                        uint8_t tmp[PAYLOAD_SIZE];
-                        radio.read(tmp, PAYLOAD_SIZE);
-                        handleRadioPacket(tmp);
-                        if (!kaWaitingPong) break;  // got pong
-                    }
-                }
             }
         }
     } else if (!kaInitiator && (state == S_DATA || state == S_CONNECTED)) {
