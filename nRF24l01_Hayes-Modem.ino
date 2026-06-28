@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.74.0"
+#define MODEM_VERSION "v1.75.1"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -1311,6 +1311,7 @@ void speedTestEcho() {
     Serial.print(F("\r\nATTEST-ECHO: reflecting packets — any key to stop\r\n"));
 
     uint32_t echoCount  = 0;
+    uint32_t iCount     = 0;   // packets this interval
     uint32_t dropStart  = rxDropped;
     unsigned long echoStart = millis();
     unsigned long lastStats = echoStart;
@@ -1341,6 +1342,7 @@ void speedTestEcho() {
                 // Flush the echo immediately
                 flushTxBuffer();
                 echoCount++;
+                iCount++;
             } else {
                 handleRadioPacket(pkt);
             }
@@ -1349,11 +1351,12 @@ void speedTestEcho() {
         unsigned long now = millis();
         if (now - lastStats >= TEST_STATS_MS) {
             unsigned long elapsed = (now - echoStart) / 1000UL;
-            uint32_t speed = elapsed ? (echoCount * MAX_DATA / elapsed) : 0;
+            uint32_t speed = iCount * MAX_DATA;   // bytes in last second
             Serial.print(F("[ECHO] t="));    Serial.print(elapsed);
             Serial.print(F("s  pkts="));     Serial.print(echoCount);
             Serial.print(F("  speed="));     Serial.print(speed);
-            Serial.print(F(" Payload B/s  drop=")); Serial.println(rxDropped - dropStart);
+            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - dropStart);
+            iCount    = 0;
             lastStats = now;
         }
     }
@@ -1672,7 +1675,7 @@ void processCommand(const char *cmd) {
 
     // ── ATSMYMAC? / ATSMYMAC=XXYYZZ ─────────────────────────────────────────
     if (strcmp(uc, "ATSMYMAC?") == 0) {
-        printMac(ownMac); Serial.println();
+        printMac(ownMac); Serial.print(F("\r\n"));
         sendOK();
         return;
     }
@@ -1692,7 +1695,7 @@ void processCommand(const char *cmd) {
 
     // ── ATSETCH? / ATSETCH=nn ──────────────────────────────────────────────
     if (strcmp(uc, "ATSETCH?") == 0) {
-        Serial.println(channel);
+        Serial.print(channel); Serial.print(F("\r\n"));
         sendOK();
         return;
     }
@@ -1714,9 +1717,9 @@ void processCommand(const char *cmd) {
 
     // ── ATSSPEED? / ATSSPEED=n ─────────────────────────────────────────────
     if (strcmp(uc, "ATSSPEED?") == 0) {
-        if      (speedEnum == 0) Serial.println(F("0 (250 kbps)"));
-        else if (speedEnum == 2) Serial.println(F("2 (2 Mbps)"));
-        else                     Serial.println(F("1 (1 Mbps)"));
+        if      (speedEnum == 0) Serial.print(F("0 (250 kbps)\r\n"));
+        else if (speedEnum == 2) Serial.print(F("2 (2 Mbps)\r\n"));
+        else                     Serial.print(F("1 (1 Mbps)\r\n"));
         sendOK();
         return;
     }
@@ -1860,7 +1863,7 @@ void processCommand(const char *cmd) {
         if (isQuery) {
             char buf[4];
             snprintf(buf, sizeof(buf), "%03u", *regPtr);
-            Serial.println(buf);
+            Serial.print(buf); Serial.print(F("\r\n"));
             sendOK();
         } else {
             int val = atoi(p + 1);
@@ -1880,7 +1883,7 @@ void processCommand(const char *cmd) {
         uint8_t slot = (uint8_t)(uc[4] - '0');
         if (slot >= DIAL_SLOTS) { sendError(); return; }
         if (uc[5] == '?') {
-            Serial.println(dialStr[slot][0] ? dialStr[slot] : "(empty)");
+            Serial.print(dialStr[slot][0] ? dialStr[slot] : "(empty)"); Serial.print(F("\r\n"));
             sendOK();
         } else if (uc[5] == '=') {
             // Use original cmd pointer (not uc) to preserve case in stored string.
@@ -1902,9 +1905,9 @@ void processCommand(const char *cmd) {
     if (strncmp(uc, "AT&Y", 4) == 0 && cmdLen >= 5) {
         if (uc[4] == '?') {
             if (startupSlot < DIAL_SLOTS) {
-                Serial.println(startupSlot);
+                Serial.print(startupSlot); Serial.print(F("\r\n"));
             } else {
-                Serial.println(F("none"));
+                Serial.print(F("none\r\n"));
             }
             sendOK();
         } else {
@@ -1918,7 +1921,7 @@ void processCommand(const char *cmd) {
 
     // ── ATSBAUD? / ATSBAUD=n ───────────────────────────────────────────────
     if (strcmp(uc, "ATSBAUD?") == 0) {
-        Serial.println(baudTable[baudIdx]);
+        Serial.print(baudTable[baudIdx]); Serial.print(F("\r\n"));
         sendOK();
         return;
     }
@@ -1951,9 +1954,9 @@ void processCommand(const char *cmd) {
 
     // ── ATSFLOW? / ATSFLOW=n ────────────────────────────────────────────────
     if (strcmp(uc, "ATSFLOW?") == 0) {
-        if      (flowMode == 0) Serial.println(F("0 (transparent)"));
-        else if (flowMode == 1) Serial.println(F("1 (HWACK)"));
-        else                    Serial.println(F("2 (SWFLOW)"));
+        if      (flowMode == 0) Serial.print(F("0 (transparent)\r\n"));
+        else if (flowMode == 1) Serial.print(F("1 (HWACK)\r\n"));
+        else                    Serial.print(F("2 (SWFLOW)\r\n"));
         sendOK();
         return;
     }
