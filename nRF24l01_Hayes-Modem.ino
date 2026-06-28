@@ -61,8 +61,8 @@
  *   ATSPECTRUM       – sweep 126 channels, print ASCII spectrum; any key stops
  *   ATPINGXXYYZZ     – diagnostic ping to MAC XXYYZZ (idle only); prints PONG from XXXXXX
  *   ATREBOOT         – hardware reboot via watchdog (boots fresh from EEPROM)
- *   ATTEST-TX        – speed test TX: flood sequenced packets; paired with ATTEST-RX
- *   ATTEST-RX        – speed test RX: arm on magic, report throughput + link quality
+ *   ATTEST-TX        – speed test TX: flood test pattern, print stats every 1 s
+ *   ATTEST-RX        – speed test RX: receive and count bytes, print stats every 1 s
  *   ATTEST-ECHO      – speed test echo: reflect received packets back to sender
  *
  * S-registers (ATSn=value to set, ATSn? to query; all saved to EEPROM):
@@ -115,7 +115,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.61.0"
+#define MODEM_VERSION "v1.63.1"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -335,7 +335,7 @@ bool     escapeArmed = false;    // true after first guard silence
 
 // SWFLOW duplicate detection
 uint8_t  rxLastSeq   = 0xFF;    // last accepted PKT_DATA seq (0xFF = none yet)
-bool     testStopFlag = false;  // set by flushTxBuffer when PKT_TEST_STOP received
+
 
 // ── LED helpers ───────────────────────────────────────────────────────────────
 
@@ -628,12 +628,26 @@ bool sendControlPacket(uint8_t type) {
     return sendPacket(type, nullptr, 0);
 }
 
-// ── Speed test constants (defined here so flushTxBuffer can reference them) ───
-#define TEST_MAGIC     0xDEADBEEFUL
-#define TEST_PAY       MAX_DATA       // 29 bytes per packet
+// ── Speed test constants ──────────────────────────────────────────────────────
 #define TEST_STATS_MS  1000           // print stats every 1 s
-#define TEST_FLAG_OK   0x00           // payload[8]: normal packet
-#define TEST_FLAG_STOP 0xFF           // payload[8]: stop signal embedded in data
+
+// Build one 29-byte test packet: "Test123_ NNNNNNNNNN\r\n          "
+// prefix(8) + 10-digit counter + CR LF + 9 spaces = 29 bytes exactly.
+// Counter wraps at 10^10 (harmless — visual indicator only).
+static void buildTestPacket(uint8_t *buf, uint32_t counter) {
+    // prefix
+    memcpy(buf, "Test123_", 8);
+    // 10-digit zero-padded decimal counter
+    uint32_t c = counter % 10000000000UL;   // keep 10 digits
+    for (int8_t d = 9; d >= 0; d--) {
+        buf[8 + d] = '0' + (c % 10);
+        c /= 10;
+    }
+    buf[18] = '\r';
+    buf[19] = '\n';
+    // pad remainder with spaces
+    memset(buf + 20, ' ', MAX_DATA - 20);
+}
 
 // ── Send buffered TX data over the air ───────────────────────────────────────
 // SWFLOW: pure stop-and-wait. Send one packet, wait SW_ACK_WAIT_MS for SWACK.
@@ -706,17 +720,6 @@ void flushTxBuffer() {
                     gotAck = true;
                 } else if (pt == PKT_XON || pt == PKT_XOFF) {
                     handleRadioPacket(tmp);
-                } else if (pt == PKT_TEST_STOP) {
-                    testStopFlag = true;   // signal test loop to exit
-                    gotAck = true;         // exit retransmit loop cleanly
-                } else if (pt == PKT_DATA &&
-                           tmp[2] >= 9 &&
-                           tmp[DATA_OFFSET + 8] == TEST_FLAG_STOP &&
-                           readU32(tmp + DATA_OFFSET + 4) == TEST_MAGIC) {
-                    // Stop-flagged data packet from RX — set flag directly
-                    // instead of buffering in pendingPkt (which may be full).
-                    testStopFlag = true;
-                    gotAck = true;
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
@@ -853,7 +856,6 @@ void handleRadioPacket(const uint8_t *pkt) {
                 swLastPktValid = false;
                 rxLastSeq      = 0xFF;
                 swRetxCount    = 0;
-                testStopFlag   = false;
                 kaInitiator   = true;
                 kaMissed      = 0;
                 kaWaitingPong = false;
@@ -979,7 +981,6 @@ void doAnswer() {
     swLastPktValid = false;
     rxLastSeq      = 0xFF;
     swRetxCount    = 0;
-    testStopFlag   = false;
     sendConnectAck();
     kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
     kaMissed      = 0;
@@ -1205,15 +1206,6 @@ bool channelIsBusy() {
 //   [4..7]  uint32_t magic 0xDEADBEEF  ← RX arms on first packet with this magic
 //   [8..28] 0xAA fill
 //
-// TEST_MAGIC / TEST_PAY / TEST_FLAG_* defined near top of file (before flushTxBuffer)
-
-// Write a uint32 little-endian into a buffer
-static void writeU32(uint8_t *p, uint32_t v) {
-    p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24);
-}
-static uint32_t readU32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
-}
 
 void speedTestTX() {
     if (state != S_CONNECTED) {
@@ -1222,8 +1214,8 @@ void speedTestTX() {
     }
     Serial.print(F("\r\nATTEST-TX: sending — any key to stop\r\n"));
 
-    uint32_t seqNum     = 0;
     uint32_t totalBytes = 0;
+    uint32_t pktCount   = 0;
     uint32_t retxStart  = swRetxCount;
     uint32_t dropStart  = txDropped;
     unsigned long testStart = millis();
@@ -1231,81 +1223,53 @@ void speedTestTX() {
 
     state = S_DATA;
 
-    // Send PKT_TEST_START so RX arms/re-arms cleanly
-    sendControlPacket(PKT_TEST_START);
-
     while (true) {
-        // Keypress — embed STOP flag in a final sequenced packet so it
-        // travels through the same reliable data path as all other packets.
-        if (Serial.available()) {
-            Serial.read();
-            uint8_t stopPay[TEST_PAY];
-            writeU32(stopPay,     seqNum);
-            writeU32(stopPay + 4, TEST_MAGIC);
-            stopPay[8] = TEST_FLAG_STOP;
-            memset(stopPay + 9, 0xAA, TEST_PAY - 9);
-            for (uint8_t i = 0; i < TEST_PAY; i++) txPush(stopPay[i]);
-            flushTxBuffer();
-            break;
-        }
+        if (Serial.available()) { Serial.read(); break; }
 
-        // Stop signal is detected inside flushTxBuffer's ACK wait loop
-        // and sets testStopFlag — catches it even when pendingPkt is full.
-        if (testStopFlag) {
-            testStopFlag    = false;
-            pendingPktReady = false;
-            Serial.print(F("\r\n[TX] RX stopped the test\r\n"));
-            break;
-        }
-        if (pendingPktReady) { pendingPktReady = false; }
-
-        // Build and send normal test payload
-        uint8_t payload[TEST_PAY];
-        writeU32(payload,     seqNum);
-        writeU32(payload + 4, TEST_MAGIC);
-        payload[8] = TEST_FLAG_OK;
-        memset(payload + 9, 0xAA, TEST_PAY - 9);
-        for (uint8_t i = 0; i < TEST_PAY; i++) txPush(payload[i]);
+        // Build and send one test packet with incrementing counter
+        uint8_t payload[MAX_DATA];
+        buildTestPacket(payload, pktCount);
+        for (uint8_t i = 0; i < MAX_DATA; i++) txPush(payload[i]);
         flushTxBuffer();
-        totalBytes += TEST_PAY;
-        seqNum++;
+        totalBytes += MAX_DATA;
+        pktCount++;
 
-        // testStopFlag checked at loop top covers this case
+        // Discard any inbound data (e.g. echo) during test
+        if (pendingPktReady) { pendingPktReady = false; }
 
         unsigned long now = millis();
         if (now - lastStats >= TEST_STATS_MS) {
             unsigned long elapsed = (now - testStart) / 1000UL;
-            uint32_t speed = elapsed ? (totalBytes / elapsed) : totalBytes;
-            uint32_t retx = swRetxCount - retxStart;
-            uint32_t retxPct = seqNum ? (retx * 100 / seqNum) : 0;
+            uint32_t speed  = elapsed ? (totalBytes / elapsed) : totalBytes;
+            uint32_t retx   = swRetxCount - retxStart;
+            uint32_t retxPct = pktCount ? (retx * 100UL / pktCount) : 0;
             Serial.print(F("[TX] t="));    Serial.print(elapsed);
-            Serial.print(F("s  pkts="));   Serial.print(seqNum);
+            Serial.print(F("s  pkts="));   Serial.print(pktCount);
             Serial.print(F("  speed="));   Serial.print(speed);
-            Serial.print(F(" Payload B/s  retx=")); Serial.print(retx);
-            Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
+            Serial.print(F(" B/s  retx=")); Serial.print(retx);
+            Serial.print(F(" ("));  Serial.print(retxPct);  Serial.print(F("%)"));
             Serial.print(F("  drop="));    Serial.println(txDropped - dropStart);
             lastStats = now;
         }
     }
 
-tx_done:
     {
         unsigned long elapsed = millis() - testStart;
-        uint32_t speed = elapsed ? (totalBytes * 1000UL / elapsed) : 0;
-        uint32_t retx = swRetxCount - retxStart;
-        uint32_t retxPct = seqNum ? (retx * 100 / seqNum) : 0;
-        Serial.print(F("\r\n[TX DONE] pkts=")); Serial.print(seqNum);
-        Serial.print(F("  speed="));   Serial.print(speed);
-        Serial.print(F(" Payload B/s  retx=")); Serial.print(retx);
-        Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
+        uint32_t speed  = elapsed ? (totalBytes * 1000UL / elapsed) : 0;
+        uint32_t retx   = swRetxCount - retxStart;
+        uint32_t retxPct = pktCount ? (retx * 100UL / pktCount) : 0;
+        Serial.print(F("\r\n[TX DONE] pkts=")); Serial.print(pktCount);
+        Serial.print(F("  bytes="));  Serial.print(totalBytes);
+        Serial.print(F("  speed="));  Serial.print(speed);
+        Serial.print(F(" B/s  retx=")); Serial.print(retx);
+        Serial.print(F(" ("));  Serial.print(retxPct);  Serial.print(F("%)"));
         Serial.print(F("  drop="));    Serial.println(txDropped - dropStart);
     }
     pendingPktReady = false;
-    testStopFlag    = false;
-    // Reset KA timers so keep-alive resumes cleanly.
-    kaPingAt     = millis() + (unsigned long)regS11 * 1000UL;
-    kaLastPingMs = millis();
-    kaMissed     = 0;
+    clearBuffers();
+    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+    kaLastPingMs  = millis();
+    kaMissed      = 0;
     kaWaitingPong = false;
     state = S_CONNECTED;
     sendOK();
@@ -1316,175 +1280,70 @@ void speedTestRX() {
         Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
         return;
     }
-    Serial.print(F("\r\nATTEST-RX: waiting for test stream — any key to stop\r\n"));
+    Serial.print(F("\r\nATTEST-RX: receiving — any key to stop\r\n"));
 
-    bool     armed       = false;
-    uint32_t expectedSeq = 0;
-    uint32_t totalBytes  = 0;
-    uint32_t lostPkts    = 0;
-    uint32_t dupPkts     = 0;
-    uint32_t recvPkts    = 0;
-    uint32_t maxBurst    = 0;   // largest consecutive loss run seen
-    uint32_t dropStart   = rxDropped;
-    unsigned long testStart = 0;
-    unsigned long lastStats = 0;
+    uint32_t totalBytes = 0;
+    uint32_t pktCount   = 0;
+    uint32_t dropStart  = rxDropped;
+    unsigned long testStart = millis();
+    unsigned long lastStats = testStart;
 
     state = S_DATA;
 
     while (true) {
-        // Keypress — send a stop-flagged data packet to TX so it exits cleanly.
-        // Using a PKT_DATA packet with TEST_FLAG_STOP means it travels the
-        // same reliable stop-and-wait path as all other packets.
-        if (Serial.available()) {
-            Serial.read();
-            uint8_t stopPay[TEST_PAY];
-            writeU32(stopPay,     0xFFFFFFFFUL);  // unmistakable seq sentinel
-            writeU32(stopPay + 4, TEST_MAGIC);
-            stopPay[8] = TEST_FLAG_STOP;
-            memset(stopPay + 9, 0xAA, TEST_PAY - 9);
-            for (uint8_t i = 0; i < TEST_PAY; i++) txPush(stopPay[i]);
-            flushTxBuffer();
-            break;
-        }
+        if (Serial.available()) { Serial.read(); break; }
 
-        unsigned long now = millis();
-
-        // Drain pending packet — check for stop flag first
+        // Let the normal radio receive path run
         if (pendingPktReady) {
             pendingPktReady = false;
-            if (pendingPkt[0] == PKT_DATA &&
-                pendingPkt[2] >= 9 &&
-                pendingPkt[DATA_OFFSET + 8] == TEST_FLAG_STOP &&
-                readU32(pendingPkt + DATA_OFFSET + 4) == TEST_MAGIC) {
-                Serial.print(F("\r\n[RX] TX stop flag received\r\n"));
-                goto rx_done;
-            } else if (pendingPkt[0] != PKT_TEST_START &&
-                       pendingPkt[0] != PKT_TEST_STOP) {
-                handleRadioPacket(pendingPkt);
-            }
+            handleRadioPacket(pendingPkt);
         }
-
         if (radio.available()) {
             uint8_t pkt[PAYLOAD_SIZE];
             radio.read(pkt, PAYLOAD_SIZE);
-            uint8_t pt = pkt[0];
-
-            if (pt == PKT_TEST_STOP) {
-                // TX stopped the test
-                Serial.print(F("\r\n[RX] TX stopped the test\r\n"));
-                goto rx_done;
-            }
-
-            if (pt == PKT_TEST_START) {
-                // TX starting or restarting — re-arm cleanly
-                if (armed) {
-                    Serial.print(F("\r\n[RX] TX restarted — re-arming\r\n"));
-                }
-                armed       = false;
-                expectedSeq = 0;
-                totalBytes  = 0;
-                lostPkts    = 0;
-                dupPkts     = 0;
-                recvPkts    = 0;
-                maxBurst    = 0;
-                dropStart   = rxDropped;
-                testStart   = 0;
-                lastStats   = 0;
-                continue;
-            }
-
-            if (pt == PKT_DATA) {
-                uint8_t *pay = pkt + DATA_OFFSET;
-                uint32_t seq   = readU32(pay);
-                uint32_t magic = readU32(pay + 4);
-                uint8_t  flag  = (pkt[2] >= 9) ? pay[8] : TEST_FLAG_OK;
-
-                if (!armed) {
-                    if (magic == TEST_MAGIC) {
-                        armed       = true;
-                        expectedSeq = seq;
-                        testStart   = millis();
-                        lastStats   = testStart;
-                        Serial.print(F("[RX] armed on seq="));
-                        Serial.println(seq);
-                        swflowAckData(pkt[1]);
-                    }
-                } else {
-                    // Count packet before checking stop flag
-                    if (seq == expectedSeq) {
-                        expectedSeq++;
-                        totalBytes += TEST_PAY;
-                        recvPkts++;
-                    } else if (seq > expectedSeq) {
-                        uint32_t gap = seq - expectedSeq;
-                        lostPkts   += gap;
-                        if (gap > maxBurst) maxBurst = gap;
-                        expectedSeq = seq + 1;
-                        totalBytes += TEST_PAY;
-                        recvPkts++;
-                    } else {
-                        dupPkts++;
-                    }
-                    swflowAckData(pkt[1]);
-                    // Check stop flag AFTER ACKing so TX gets confirmation
-                    if (flag == TEST_FLAG_STOP) {
-                        Serial.print(F("\r\n[RX] TX stop flag received\r\n"));
-                        goto rx_done;
-                    }
-                }
-            } else {
-                handleRadioPacket(pkt);
-            }
+            handleRadioPacket(pkt);
         }
 
-        if (armed && (now - lastStats >= TEST_STATS_MS)) {
+        // Drain rxBuf — count bytes, discard (don't print to serial)
+        while (rxAvail() > 0) {
+            rxPop();
+            totalBytes++;
+        }
+        if (totalBytes > 0 && pktCount == 0) pktCount = 1;  // armed on first byte
+
+        unsigned long now = millis();
+        if (now - lastStats >= TEST_STATS_MS) {
+            // Snapshot packet count from totalBytes / MAX_DATA
+            pktCount = totalBytes / MAX_DATA;
             unsigned long elapsed = (now - testStart) / 1000UL;
             uint32_t speed = elapsed ? (totalBytes / elapsed) : totalBytes;
-            uint32_t total = recvPkts + lostPkts;
-            uint32_t pdr   = total ? (recvPkts * 100 / total) : 100;
             Serial.print(F("[RX] t="));    Serial.print(elapsed);
-            Serial.print(F("s  pkts="));   Serial.print(recvPkts);
+            Serial.print(F("s  pkts="));   Serial.print(pktCount);
             Serial.print(F("  speed="));   Serial.print(speed);
-            Serial.print(F(" Payload B/s  PDR="));  Serial.print(pdr);
-            Serial.print(F("%  lost="));   Serial.print(lostPkts);
-            Serial.print(F("  burst="));   Serial.print(maxBurst);
-            Serial.print(F("  dup="));      Serial.print(dupPkts);
-            Serial.print(F("  drop="));     Serial.println(rxDropped - dropStart);
+            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - dropStart);
             lastStats = now;
         }
     }
 
-rx_done:
-    if (armed) {
+    {
         unsigned long elapsed = millis() - testStart;
         uint32_t speed = elapsed ? (totalBytes * 1000UL / elapsed) : 0;
-        uint32_t total = recvPkts + lostPkts;
-        uint32_t pdr   = total ? (recvPkts * 100 / total) : 100;
-        Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(recvPkts);
-        Serial.print(F("  speed="));   Serial.print(speed);
-        Serial.print(F(" Payload B/s  PDR="));  Serial.print(pdr);
-        Serial.print(F("%  lost="));   Serial.print(lostPkts);
-        Serial.print(F("  burst="));   Serial.print(maxBurst);
-        Serial.print(F("  dup="));      Serial.print(dupPkts);
-        Serial.print(F("  drop="));     Serial.println(rxDropped - dropStart);
-    } else {
-        Serial.print(F("\r\n[RX] no test stream received\r\n"));
+        pktCount = totalBytes / MAX_DATA;
+        Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(pktCount);
+        Serial.print(F("  bytes="));  Serial.print(totalBytes);
+        Serial.print(F("  speed="));  Serial.print(speed);
+        Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - dropStart);
     }
     pendingPktReady = false;
     clearBuffers();
-    // Reset KA timers so keep-alive resumes cleanly.
-    kaPingAt     = millis() + (unsigned long)regS11 * 1000UL;
-    kaLastPingMs = millis();
-    kaMissed     = 0;
+    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+    kaLastPingMs  = millis();
+    kaMissed      = 0;
     kaWaitingPong = false;
     state = S_CONNECTED;
     sendOK();
 }
 
-// ── Speed test echo ──────────────────────────────────────────────────────────
-// ATTEST-ECHO: reflects every received PKT_DATA packet back to sender.
-// Pair with ATTEST-TX on the other side. Any key stops. No stop signal
-// sent to remote — TX side just sees retx rise when echo stops replying.
 void speedTestEcho() {
     if (state != S_CONNECTED) {
         Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
@@ -1531,7 +1390,7 @@ void speedTestEcho() {
         unsigned long now = millis();
         if (now - lastStats >= TEST_STATS_MS) {
             unsigned long elapsed = (now - echoStart) / 1000UL;
-            uint32_t speed = elapsed ? (echoCount * (TEST_PAY - 9) / elapsed) : 0;
+            uint32_t speed = elapsed ? (echoCount * MAX_DATA / elapsed) : 0;
             Serial.print(F("[ECHO] t="));    Serial.print(elapsed);
             Serial.print(F("s  pkts="));     Serial.print(echoCount);
             Serial.print(F("  speed="));     Serial.print(speed);
@@ -1541,7 +1400,7 @@ void speedTestEcho() {
     }
 
     unsigned long elapsed = millis() - echoStart;
-    uint32_t speed = elapsed ? (echoCount * (TEST_PAY - 9) * 1000UL / elapsed) : 0;
+    uint32_t speed = elapsed ? (echoCount * MAX_DATA * 1000UL / elapsed) : 0;
     Serial.print(F("\r\n[ECHO DONE] pkts=")); Serial.print(echoCount);
     Serial.print(F("  speed="));   Serial.print(speed);
     Serial.print(F(" Payload B/s  drop=")); Serial.println(rxDropped - dropStart);
