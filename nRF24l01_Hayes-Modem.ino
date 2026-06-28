@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.90.0"
+#define MODEM_VERSION "v1.93.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -2140,17 +2140,19 @@ void loop() {
         if (testRxActive) {
             while (rxAvail() > 0) { rxPop(); testRxBytes++; }
             unsigned long elapsed = millis() - testStart;
-            uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
+            unsigned long elapsedSec = elapsed / 1000UL;
+            uint32_t speed = elapsedSec ? (testRxBytes / elapsedSec) : 0;
             Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
             Serial.print(F("  bytes="));  Serial.print(testRxBytes);
-            Serial.print(F("  speed="));  Serial.print(speed);
+            Serial.print(F("  avg="));  Serial.print(speed);
             Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
             testRxActive = false;
         } else {
             unsigned long elapsed = millis() - testStart;
-            uint32_t speed = elapsed ? (testEchoCount * MAX_DATA * 1000UL / elapsed) : 0;
+            unsigned long elapsedSec = elapsed / 1000UL;
+            uint32_t speed = elapsedSec ? (testEchoCount * MAX_DATA / elapsedSec) : 0;
             Serial.print(F("\r\n[ECHO DONE] pkts=")); Serial.print(testEchoCount);
-            Serial.print(F("  speed=")); Serial.print(speed);
+            Serial.print(F("  avg=")); Serial.print(speed);
             Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testEchoDropBase);
             testEchoActive = false;
             clearBuffers();
@@ -2163,12 +2165,13 @@ void loop() {
         if (Serial.available()) {
             Serial.read();
             unsigned long elapsed = millis() - testStart;
-            uint32_t speed = elapsed ? (testTxBytes * 1000UL / elapsed) : 0;
+            unsigned long elapsedSec = elapsed / 1000UL;
+            uint32_t speed = elapsedSec ? (testTxBytes / elapsedSec) : 0;
             uint32_t retx  = swRetxCount - testTxRetxBase;
             uint32_t retxPct = testTxPkts ? (retx * 100UL / testTxPkts) : 0;
             Serial.print(F("\r\n[TX DONE] pkts=")); Serial.print(testTxPkts);
             Serial.print(F("  bytes="));  Serial.print(testTxBytes);
-            Serial.print(F("  speed="));  Serial.print(speed);
+            Serial.print(F("  avg="));  Serial.print(speed);
             Serial.print(F(" B/s  retx=")); Serial.print(retx);
             Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
             Serial.print(F("  drop="));  Serial.println(txDropped - testTxDropBase);
@@ -2191,8 +2194,8 @@ void loop() {
                 }
             } else {
                 // SWFLOW/HWACK: fill txBuf up to half capacity,
-                // but honour XOFF from remote — pause like a real serial device.
-                if (!radioXoffRecv) {
+                // but honour XOFF and yield — pause like a real serial device.
+                if (!radioXoffRecv && !yieldToRemote) {
                     while (txAvail() < (TX_BUF_SIZE / 2)) {
                         uint8_t payload[MAX_DATA];
                         buildTestPacket(payload, testPktCounter);
@@ -2413,7 +2416,8 @@ void loop() {
         // Echo mode: reflect received bytes back via txBuf,
         // honouring XOFF — don't push if remote asked us to stop
         // or if txBuf is nearly full (avoids drop and lets flushTxBuffer drain first).
-        if (!radioXoffRecv && txAvail() < (TX_BUF_SIZE * 3 / 4)) {
+        // Reflect only when txBuf is empty — one echo packet at a time.
+        if (!radioXoffRecv && txAvail() == 0) {
             while (rxAvail() > 0) {
                 int b = rxPop();
                 if (b >= 0) txPush((uint8_t)b);
