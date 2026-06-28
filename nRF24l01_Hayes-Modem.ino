@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.119.0"
+#define MODEM_VERSION "v1.120.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -702,7 +702,7 @@ bool sendDirectCtrl(uint8_t type) {
 }
 
 static void errMustBeConnected() {
-    Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
+    Serial.print(F("\r\nERROR: connect first\r\n"));
 }
 
 // ── Speed test constants ──────────────────────────────────────────────────────
@@ -1257,6 +1257,10 @@ void factoryReset() {
 
 // SPECTRUM_DWELL_MS replaced by S17 register (regS17) — see ATSn handler
 
+static void printSpectrumChHdr() {
+    printSpectrumChHdr();
+}
+
 static void printSpectrumRuler() {
     Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
 }
@@ -1268,7 +1272,7 @@ void spectrumScan() {
     }
 
     Serial.println(F("SPECTRUM SCAN — any key to stop"));
-    Serial.println(F("Ch:  0         1         2         3         4         5         6         7         8         9         10        11        12"));
+    printSpectrumChHdr();
     printSpectrumRuler();
 
     // Density to ASCII lookup
@@ -1322,7 +1326,7 @@ void spectrumScan() {
         if (sweepCount >= 40) {
             sweepCount = 0;
             printSpectrumRuler();
-            Serial.println(F("Ch:  0         1         2         3         4         5         6         7         8         9         10        11        12"));
+            printSpectrumChHdr();
             printSpectrumRuler();
         }
     }
@@ -1405,7 +1409,7 @@ void speedTestTX() {
     testStart       = millis();
     testLastStats   = testStart;
     kaResetWindow();
-    Serial.print(F("\r\nATTEST-TX: sending — any key to stop\r\n"));
+    Serial.print(F("\r\nATTEST-TX: any key stops\r\n"));
 }
 
 void speedTestRX() {
@@ -1425,7 +1429,7 @@ void speedTestRX() {
     testStart       = millis();
     testLastStats   = testStart;
     kaResetWindow();
-    Serial.print(F("\r\nATTEST-RX: receiving — any key to stop\r\n"));
+    Serial.print(F("\r\nATTEST-RX: any key stops\r\n"));
 }
 
 void speedTestEcho() {
@@ -1443,7 +1447,7 @@ void speedTestEcho() {
     testStart         = millis();
     testLastStats     = testStart;
     kaResetWindow();
-    Serial.print(F("\r\nATTEST-ECHO: reflecting packets — any key to stop\r\n"));
+    Serial.print(F("\r\nATTEST-ECHO: any key stops\r\n"));
 }
 
 // ── Diagnostic ping ──────────────────────────────────────────────────────────
@@ -1502,7 +1506,7 @@ void atPing(const uint8_t targetMac[3]) {
 // lowest hit count (quietest), sets it as the active channel and saves to EEPROM.
 void autoSelectChannel() {
     if (state != S_IDLE) {
-        Serial.print(F("\r\nERROR: ATSETCHAUTO only available when idle\r\n"));
+        Serial.print(F("\r\nERROR: idle only\r\n"));
         return;
     }
     Serial.print(F("\r\nScanning channels"));
@@ -1558,7 +1562,7 @@ void speedTestTxRx() {
     testStart      = millis();
     testLastStats  = testStart;
     kaResetWindow();
-    Serial.print(F("\r\nATTEST-TXRX: sending+receiving — any key to stop\r\n"));
+    Serial.print(F("\r\nATTEST-TXRX: any key stops\r\n"));
 }
 
 // ── Command parser ────────────────────────────────────────────────────────────
@@ -1655,23 +1659,23 @@ void processCommand(const char *cmd) {
             Serial.println(F("RSSI    : N/A"));
         }
 
-        Serial.print(F("S6      : ")); Serial.print(regS6); Serial.println(F(" s  (pre-dial wait, 0=none)"));
-        Serial.print(F("S7      : ")); Serial.print(regS7); Serial.println(F(" s  (carrier timeout)"));
+        Serial.print(F("S6      : ")); Serial.print(regS6); Serial.println(F(" s  (pre-dial wait)"));
+        Serial.print(F("S7      : ")); Serial.print(regS7); Serial.println(F(" s  (carrier to)"));
         Serial.print(F("S8      : "));
         if (regS8 == 255) Serial.println(F("255  (retry forever)"));
         else { Serial.print(regS8); Serial.println(F("    (retry attempts)")); }
-        Serial.print(F("S9      : ")); Serial.print(regS9);  Serial.println(F(" s  (retry interval)"));
+        Serial.print(F("S9      : ")); Serial.print(regS9);  Serial.println(F(" s  (retry intv)"));
         Serial.print(F("S10     : ")); Serial.print(regS10); Serial.println(regS10 ? F("    (keep-alive ON)") : F("    (keep-alive OFF)"));
-        Serial.print(F("S11     : ")); Serial.print(regS11); Serial.println(F(" s  (keep-alive interval)"));
+        Serial.print(F("S11     : ")); Serial.print(regS11); Serial.println(F(" s  (KA interval)"));
         Serial.print(F("S12     : ")); Serial.print(regS12); Serial.println(F("    (missed pongs before drop)"));
         Serial.print(F("S13     : ")); Serial.println(regS13 == 1 ? F("1 (XON/XOFF enabled)") : F("0 (no flow control)"));
         Serial.print(F("S14     : ")); Serial.println(regS14 == 1 ? F("1 (busy detect ON)") : F("0 (busy detect OFF)"));
-        Serial.print(F("S15     : ")); Serial.print(regS15); Serial.println(F(" ms (channel scan duration)"));
-        Serial.print(F("S16     : ")); Serial.print(regS16); Serial.println(F(" ms (transparent TX idle flush)"));
-        Serial.print(F("S17     : ")); Serial.print(regS17); Serial.println(F(" ms (spectrum scan dwell per channel)"));
+        Serial.print(F("S15     : ")); Serial.print(regS15); Serial.println(F(" ms (scan duration)"));
+        Serial.print(F("S16     : ")); Serial.print(regS16); Serial.println(F(" ms (TX idle flush)"));
+        Serial.print(F("S17     : ")); Serial.print(regS17); Serial.println(F(" ms (spectrum dwell)"));
         Serial.print(F("S18     : ")); Serial.println(regS18 == 1 ? F("1 (silent mode ON)") : F("0 (normal output)"));
-        Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (serial->radio, host overflow)"));
-        Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (radio->serial, radio overflow)"));
+        Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (TX overflow)"));
+        Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (RX overflow)"));
         if (txDropped || rxDropped) Serial.println(F("** DATA LOSS: enable XON/XOFF (ATS13=1) **"));
         txDropped = 0;  // reset after display
         rxDropped = 0;
@@ -2089,7 +2093,7 @@ void processCommand(const char *cmd) {
     // Only available from S_IDLE — no active or pending connection.
     if (strncmp(uc, "ATPING", 6) == 0 && strlen(uc) == 12) {
         if (state != S_IDLE) {
-            Serial.print(F("\r\nERROR: ATPING only available when idle\r\n"));
+            Serial.print(F("\r\nERROR: idle only\r\n"));
             return;
         }
         uint8_t mac[3];
