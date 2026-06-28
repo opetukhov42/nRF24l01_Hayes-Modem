@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.84.0"
+#define MODEM_VERSION "v1.85.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -696,7 +696,7 @@ void flushTxBuffer() {
 
     // Cooperative yield: remote requested TX window.
     // Pending pong: send via yield mechanism before normal data
-    if (pendingPong && !yieldToRemote) {
+    if (pendingPong) {
         pendingPong = false;
         sendControlPacket(PKT_PONG);
         return;
@@ -928,10 +928,9 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaLastRcvdMs = millis();
                 if (regS10 && !kaInitiator)
                     kaLastPingMs = millis();
-                // Queue pong via yield path — guarantees delivery under
-                // heavy data flooding without timing races.
-                pendingPong   = true;
-                yieldToRemote = true;  // request TX window for pong
+                // Queue pong via yield path — swflowAckData yields when
+                // pendingPong is set, giving us a TX window to send it.
+                pendingPong = true;
             }
             break;
 
@@ -1003,7 +1002,7 @@ bool swflowAckData(uint8_t seq) {
     if (rxLastSeq != 0xFF && seq == rxLastSeq) {
         // Re-send SWACK to unblock sender
         uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
-        bool haveData = (txAvail() > 0) && !radioXoffRecv;
+        bool haveData = ((txAvail() > 0) || pendingPong) && !radioXoffRecv;
         ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
         ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
         openWritePipe(remoteMac); radio.write(ack, PAYLOAD_SIZE);
@@ -1013,9 +1012,9 @@ bool swflowAckData(uint8_t seq) {
     }
     rxLastSeq = seq;
 
-    // In-order: send SWACK (with yield if we have data)
+    // In-order: send SWACK (with yield if we have data OR a pending pong)
     uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
-    bool haveData = (txAvail() > 0) && !radioXoffRecv;
+    bool haveData = ((txAvail() > 0) || pendingPong) && !radioXoffRecv;
     ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
     ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
     openWritePipe(remoteMac);
@@ -1532,7 +1531,6 @@ void processCommand(const char *cmd) {
         Serial.print(F("S15     : ")); Serial.print(regS15); Serial.println(F(" ms (channel scan duration)"));
         Serial.print(F("S16     : ")); Serial.print(regS16); Serial.println(F(" ms (transparent TX idle flush)"));
         Serial.print(F("S17     : ")); Serial.print(regS17); Serial.println(F(" ms (spectrum scan dwell per channel)"));
-        Serial.print(F("S18     : ")); Serial.println(regS18 == 1 ? F("1 (silent mode ON)") : F("0 (normal output)"));
         Serial.print(F("S18     : ")); Serial.println(regS18 == 1 ? F("1 (silent mode ON)") : F("0 (normal output)"));
         Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (serial->radio, host overflow)"));
         Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (radio->serial, radio overflow)"));
