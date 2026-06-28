@@ -76,8 +76,8 @@
  *   S8   dial retry attempts after failure (0=no retry, 255=forever, default 3)
  *   S9   inter-retry interval seconds (default 3)
  *   S10  keep-alive enable: 1=on (default), 0=off
- *   S11  keep-alive ping interval seconds (default 5)
- *   S12  missed pings before NO CARRIER (default 3)
+ *   S11  keep-alive silence window seconds — ping sent if no activity (default 5)
+ *   S12  silent windows before NO CARRIER (default 3)
  *   S13  XON/XOFF flow control: 1=on (default), 0=off
  *        applies to both serial and radio links
  *   S14  busy detect before dial: 1=on (default), 0=off
@@ -97,10 +97,10 @@
  * Packet format (32 bytes max nRF24 payload):
  *   [0]  type   – PKT_DATA=0x01, PKT_XON=0x02, PKT_XOFF=0x03,
  *                 PKT_DISC=0x04, PKT_CONN=0x05, PKT_ACK=0x06,
- *                 PKT_NACK=0x07 (SWFLOW retransmit request),
+ *                 PKT_NACK=0x07 (reserved, unused),
  *                 PKT_SWACK=0x08 (SWFLOW cumulative ACK),
- *                 PKT_PING=0x09 (keep-alive ping),
- *                 PKT_PONG=0x0A (keep-alive reply),
+ *                 PKT_PING=0x09 (keep-alive probe — SWACK is the reply),
+ *                 PKT_PONG=0x0A (deprecated — reserved for compatibility),
  *                 PKT_SWACK_YIELD=0x0B (SWFLOW ACK + yield TX token to remote)
  *                 PKT_DIAG_PING=0x0C  (diagnostic ping, ATPING command)
  *                 PKT_DIAG_PONG=0x0D  (diagnostic pong, reply to ATPING)
@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.120.0"
+#define MODEM_VERSION "v1.123.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -220,7 +220,7 @@ uint8_t regS8        = 3;     // S8: number of retry attempts after first failur
 uint8_t regS9        = 3;     // S9: seconds between retry attempts (default 3)
 uint8_t regS10       = 1;     // S10: keep-alive enable (1=on, 0=off)
 uint8_t regS11       = 5;     // S11: keep-alive interval (seconds)
-uint8_t regS12       = 3;     // S12: missed pongs before dropping connection
+uint8_t regS12       = 3;     // S12: silent windows before dropping connection
 uint8_t regS13       = 1;     // S13: flow control 0=none, 1=XON/XOFF (default ON)
 uint8_t regS14       = 1;     // S14: busy detect enable (1=on, 0=off)
 uint8_t regS15       = 50;    // S15: channel scan duration in ms (default 50)
@@ -235,15 +235,13 @@ unsigned long connectedAt      = 0;  // millis() when current connection was est
 uint32_t txDropped   = 0;    // bytes dropped: serial→radio direction (host sent too fast)
 uint32_t rxDropped   = 0;    // bytes dropped: radio→serial direction (radio came in too fast)
 
-// Keep-alive runtime state
-bool          kaInitiator   = false; // true = we dialled (send pings); false = we answered (reply only)
-unsigned long kaPingAt      = 0;     // millis() when next PKT_PING is due
-uint8_t       kaMissed      = 0;     // consecutive unanswered pings (initiator only)
-bool          kaWaitingPong = false; // true between sending PING and receiving PONG
-unsigned long kaLastPingMs  = 0;     // answerer: millis() of last received PKT_PING (0=none yet)
-unsigned long kaLastSentMs  = 0;     // millis() of last PKT_PING sent (initiator)
-unsigned long kaLastRcvdMs  = 0;     // millis() of last PKT_PING received (answerer)
-unsigned long kaLastPongMs  = 0;     // millis() of last PKT_PONG received (initiator)
+// Keep-alive — symmetric on both sides, no initiator/responder distinction.
+// Any received packet updates kaLastConfirmedMs (link proof). Ping sent
+// only during silence; SWACK = confirmed; no pong needed.
+unsigned long kaLastConfirmedMs = 0; // millis() of last received packet
+unsigned long kaPingAt          = 0; // millis() when next probe is due
+unsigned long kaLastPingSentMs  = 0; // millis() when last PKT_PING was queued
+uint8_t       kaMissed          = 0; // consecutive unconfirmed pings
 uint8_t       ctrlPkt[PAYLOAD_SIZE];  // priority control packet (ping/pong/xon/xoff)
 bool          ctrlPktReady   = false; // true = send ctrlPkt before next data
 
@@ -736,7 +734,6 @@ void flushTxBuffer() {
     // Uses same stop-and-wait loop as data — guaranteed delivery.
     if (ctrlPktReady) {
         ctrlPktReady = false;
-        if (ctrlPkt[0] == PKT_PING) kaLastSentMs = millis();
         bool gotAck2 = false;
         bool gotYield2 = false;
         for (uint8_t attempt = 0; attempt <= SW_RETX_MAX; attempt++) {
@@ -920,6 +917,10 @@ void handleRadioPacket(const uint8_t *pkt) {
     // uint8_t seq = pkt[1];   // could be used for duplicate detection
     uint8_t len  = pkt[2];
 
+    // Any received packet proves link alive.
+    if ((state == S_DATA || state == S_CONNECTED) && regS10)
+        kaLastConfirmedMs = millis();
+
     switch (type) {
         case PKT_DATA:
             if (state == S_DATA) {
@@ -931,10 +932,6 @@ void handleRadioPacket(const uint8_t *pkt) {
                     }
                     checkFlowControl();
                 }
-                // Receiving data proves the link is alive — reset answerer
-                // KA watchdog so active data flow prevents false NO CARRIER.
-                if (!kaInitiator && regS10 && kaLastPingMs != 0)
-                    kaLastPingMs = millis();
             } else if (state == S_CONNECTED) {
                 // CLI mode: remote may still be sending — ACK to keep
                 // stop-and-wait flowing but discard data (not in data mode).
@@ -973,11 +970,10 @@ void handleRadioPacket(const uint8_t *pkt) {
                 lastDisconnectMs = millis();
     connectedAt      = 0;
                 clearBuffers();
-                kaInitiator   = false;
-                kaMissed      = 0;
-                kaWaitingPong = false;
-                kaPingAt      = 0;
-                kaLastPingMs  = 0;
+                kaMissed          = 0;
+                kaPingAt          = 0;
+                kaLastPingSentMs  = 0;
+                kaLastConfirmedMs = 0;
                 yieldToRemote  = false;
                 ctrlPktReady   = false;
                 swLastPktValid = false;
@@ -1016,11 +1012,9 @@ void handleRadioPacket(const uint8_t *pkt) {
                 swLastPktValid = false;
                 rxLastSeq      = 0xFF;
                 swRetxCount    = 0;
-                kaInitiator   = true;
-                kaMissed      = 0;
-                kaWaitingPong = false;
-                kaLastPongMs  = 0;
-                kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+                kaMissed          = 0;
+                kaLastConfirmedMs = millis();
+                kaPingAt          = millis() + (unsigned long)regS11 * 1000UL;
                 connectedAt   = millis();
                 sendConnect();           // print while still in CLI mode
                 state         = S_DATA;  // switch AFTER printing CONNECT
@@ -1028,23 +1022,10 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_PING:
-            if (state == S_DATA || state == S_CONNECTED) {
-                kaLastRcvdMs = millis();
-                if (regS10 && !kaInitiator)
-                    kaLastPingMs = millis();
-                queueCtrl(PKT_PONG);     // queue first so swflowAckData yields
-                swflowAckData(pkt[1]);   // ACK ping with SWACK_YIELD (ctrlPktReady=true)
-            }
+            if (state == S_DATA || state == S_CONNECTED)
+                swflowAckData(pkt[1]);  // SWACK proves delivery to sender
             break;
 
-        case PKT_PONG:
-            if (state == S_DATA || state == S_CONNECTED) {
-                kaMissed      = 0;
-                kaWaitingPong = false;
-                kaLastPongMs  = millis();
-                swflowAckData(pkt[1]);   // ACK the pong
-            }
-            break;
 
         case PKT_DIAG_PING:
             // Diagnostic ping received — only reply if we are fully idle.
@@ -1134,11 +1115,9 @@ bool swflowAckData(uint8_t seq) {
 // Call on every S_DATA <-> S_CONNECTED transition so KA always starts with
 // a clean full window regardless of time spent in the previous state.
 void kaResetWindow() {
-    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
-    kaWaitingPong = false;
-    kaMissed      = 0;
-    if (!kaInitiator)
-        kaLastPingMs = millis();
+    kaLastConfirmedMs = millis();
+    kaPingAt          = millis() + (unsigned long)regS11 * 1000UL;
+    kaMissed          = 0;
 }
 
 // Complete an incoming call: copy pending MAC, ACK the caller, enter DATA mode.
@@ -1156,12 +1135,10 @@ void doAnswer() {
     rxLastSeq      = 0xFF;
     swRetxCount    = 0;
     sendConnectAck();
-    kaInitiator   = false;  // we answered — remote owns keep-alive, we only reply
-    kaMissed      = 0;
-    kaWaitingPong = false;
-    kaPingAt      = 0;      // answerer never initiates pings
-    kaLastPingMs  = millis(); // arm watchdog from connect time
-    connectedAt   = millis();
+    kaMissed          = 0;
+    kaLastConfirmedMs = millis();
+    kaPingAt          = millis() + (unsigned long)regS11 * 1000UL;
+    connectedAt       = millis();
     sendConnect();           // print while still in CLI mode
     state         = S_DATA;  // switch to data mode AFTER printing CONNECT
 }
@@ -1215,11 +1192,9 @@ void factoryReset() {
     autoDial       = false;
     lastConnMs     = 0;
     memset(lastDialStr, 0, sizeof(lastDialStr));
-    kaInitiator    = false;
-    kaMissed       = 0;
-    kaWaitingPong  = false;
-    kaPingAt       = 0;
-    kaLastPingMs   = 0;
+    kaMissed          = 0;
+    kaPingAt          = 0;
+    kaLastConfirmedMs = 0;
     yieldToRemote  = false;
     swLastPktValid = false;
     rxLastSeq      = 0xFF;
@@ -1679,23 +1654,10 @@ void processCommand(const char *cmd) {
         if (txDropped || rxDropped) Serial.println(F("** DATA LOSS: enable XON/XOFF (ATS13=1) **"));
         txDropped = 0;  // reset after display
         rxDropped = 0;
-        if (state == S_DATA || state == S_CONNECTED) {
-            Serial.print(F("KA role : ")); Serial.println(kaInitiator ? F("initiator (sends pings)") : F("responder (replies only)"));
-        }
-        if (regS10 && kaInitiator && (state == S_DATA || state == S_CONNECTED)) {
+        if (regS10 && (state == S_DATA || state == S_CONNECTED)) {
+            { unsigned long s = kaLastConfirmedMs ? (millis()-kaLastConfirmedMs)/1000UL : 9999;
+              Serial.print(F("KA last : ")); Serial.print(s); Serial.println(F("s ago")); }
             Serial.print(F("KA miss : ")); Serial.println(kaMissed);
-        }
-        if (regS10 && !kaInitiator && (state == S_DATA || state == S_CONNECTED)) {
-            if (kaLastPingMs != 0) {
-                unsigned long ageSec = (millis() - kaLastPingMs) / 1000UL;
-                unsigned long windowSec = (unsigned long)regS11 * regS12;
-                Serial.print(F("Last ping: ")); Serial.print(ageSec);
-                Serial.print(F(" s ago (timeout "));
-                Serial.print(windowSec);
-                Serial.println(F(" s)"));
-            } else {
-                Serial.println(F("Last ping: none yet"));
-            }
         }
         Serial.print(F("Startup : "));
         if (startupSlot < DIAL_SLOTS && dialStr[startupSlot][0] != '\0') {
@@ -1745,11 +1707,10 @@ void processCommand(const char *cmd) {
         transBufLen = 0;
         dialRetrying   = false;
         dialRetryCount = 0;
-        kaInitiator    = false;
-        kaMissed       = 0;
-        kaWaitingPong  = false;
-        kaPingAt       = 0;
-        kaLastPingMs   = 0;
+        kaMissed          = 0;
+        kaPingAt          = 0;
+        kaLastPingSentMs  = 0;
+        kaLastConfirmedMs = 0;
         yieldToRemote  = false;
         ctrlPktReady   = false;
         swLastPktValid = false;
@@ -2250,55 +2211,27 @@ void setup() {
 
 // ── KA stats helper for test output ──────────────────────────────────────────
 // Prints role-specific KA status at end of every test stats line.
+
+// ── KA stats for test output ─────────────────────────────────────────────────
 void printKaStats() {
-    unsigned long now = millis();
-    if (kaInitiator) {
-        // ── Sender role ──────────────────────────────────────────────────────
-        Serial.print(F("  KA[Sndr]:"));
-        bool sentRecently = kaLastSentMs && (now - kaLastSentMs) < TEST_STATS_MS;
-        bool pongRecently = kaLastPongMs && (now - kaLastPongMs) < TEST_STATS_MS;
-        if (kaMissed > 0) {
-            // Show ping activity even while missing — ping still fires on schedule
-            if (sentRecently) Serial.print(F("ping/"));
-            Serial.print(F("miss ")); Serial.print(kaMissed);
-            Serial.print(F("/")); Serial.println(regS12);
-        } else if (pongRecently) {
-            Serial.println(F("ping-pong"));   // pong received this second
-        } else if (kaWaitingPong) {
-            if (sentRecently)
-                Serial.println(F("ping-sent")); // just sent, waiting
-            else
-                Serial.println(F("ping-wait")); // sent a while ago, still waiting
-        } else {
-            // Sleeping between pings — show countdown
-            unsigned long nextMs = kaPingAt > now ? (kaPingAt - now) / 1000UL : 0;
-            Serial.print(F("sleep("));
-            Serial.print(nextMs);
-            Serial.println(F("s)"));
-        }
+    unsigned long now      = millis();
+    unsigned long ageSec   = kaLastConfirmedMs ? (now - kaLastConfirmedMs) / 1000UL : 9999UL;
+    unsigned long winSec   = (unsigned long)regS11 * (unsigned long)regS12;
+    bool          pingSent = kaLastPingSentMs && (now - kaLastPingSentMs) < TEST_STATS_MS;
+    Serial.print(F("  KA:"));
+    if (kaMissed > 0) {
+        if (pingSent) Serial.print(F("ping/"));
+        Serial.print(F("miss ")); Serial.print(kaMissed);
+        Serial.print(F("/"));    Serial.println(regS12);
+    } else if (pingSent) {
+        Serial.println(F("ping-sent"));
+    } else if (ageSec == 0) {
+        Serial.println(F("ok"));
+    } else if (ageSec < winSec) {
+        Serial.print(ageSec); Serial.print(F("s/"));
+        Serial.print(winSec); Serial.println(F("s"));
     } else {
-        // ── Receiver role ────────────────────────────────────────────────────
-        Serial.print(F("  KA[Rcvr]:"));
-        bool rcvdRecently = kaLastRcvdMs && (now - kaLastRcvdMs) < TEST_STATS_MS;
-        if (kaLastPingMs == 0) {
-            Serial.println(F("waiting"));   // no ping received yet
-        } else {
-            unsigned long kaAgeSec = (now - kaLastPingMs) / 1000UL;
-            unsigned long kaWinSec = (unsigned long)regS11 * (unsigned long)regS12;
-            if (kaAgeSec >= kaWinSec) {
-                Serial.println(F("timeout!"));
-            } else if (rcvdRecently) {
-                Serial.println(F("got-ping/pong-sent"));
-            } else if (kaAgeSec == 0) {
-                Serial.println(F("ok"));
-            } else {
-                // Show watchdog countdown
-                Serial.print(kaAgeSec);
-                Serial.print(F("s/"));
-                Serial.print(kaWinSec);
-                Serial.println(F("s"));
-            }
-        }
+        Serial.println(F("timeout?"));
     }
 }
 
@@ -2699,69 +2632,39 @@ void loop() {
         }
     }
 
-    // ── 10. Keep-alive tick ──────────────────────────────────────────────────
-    if (regS10 && kaInitiator && (state == S_DATA || state == S_CONNECTED)) {
+    // ── 10. Keep-alive tick — symmetric, same logic on both sides ────────────
+    if (regS10 && (state == S_DATA || state == S_CONNECTED)) {
         if (kaPingAt == 0)
             kaPingAt = now + (unsigned long)regS11 * 1000UL;
-
         if (now >= kaPingAt) {
-            if (kaWaitingPong) {
-                // Full S11 window elapsed with no pong — count as miss
+            unsigned long silenceMs = kaLastConfirmedMs ? now - kaLastConfirmedMs : now;
+            if (silenceMs < (unsigned long)regS11 * 1000UL) {
+                // Recent activity confirmed — link alive, reset window
+                kaMissed = 0;
+                kaPingAt = now + (unsigned long)regS11 * 1000UL;
+            } else {
+                // Silence for a full S11 window — probe or count miss
                 kaMissed++;
-                cliPrint(F("KA miss "));
-                cliPrint(kaMissed);
-                cliPrint('/');
-                cliPrintln(regS12);
+                cliPrint(F("KA miss ")); cliPrint(kaMissed);
+                cliPrint('/'); cliPrintln(regS12);
                 ledFlashER();
                 if (kaMissed >= regS12) {
                     lastDisconnectMs = millis();
                     clearBuffers();
-                    kaMissed      = 0;
-                    kaWaitingPong = false;
-                    kaPingAt      = 0;
-                    kaLastPingMs  = 0;
+                    kaMissed = 0; kaPingAt = 0;
+                    kaLastPingSentMs  = 0;
+                    kaLastConfirmedMs = 0;
                     state = S_IDLE;
                     openListenPipes();
                     sendNoCarrier();
                 } else {
                     queueCtrl(PKT_PING);
-                    kaPingAt      = now + (unsigned long)regS11 * 1000UL;
+                    kaLastPingSentMs = millis();
+                    kaPingAt = now + (unsigned long)regS11 * 1000UL;
                 }
-            } else {
-                queueCtrl(PKT_PING);
-                kaWaitingPong = true;
-                kaPingAt      = now + (unsigned long)regS11 * 1000UL;
             }
-        }
-    } else if (!kaInitiator && (state == S_DATA || state == S_CONNECTED)) {
-        // Answerer watchdog: we don't send pings, but we track receiving them.
-        if (regS10 && kaLastPingMs != 0) {
-            // Timeout = S11 * S12 seconds — the full window the initiator would
-            // exhaust before giving up. If we haven't seen a ping in that window
-            // the initiator is gone (or their S10 was turned off mid-session).
-            // Use millis() directly here (not stale 'now') because kaLastPingMs
-            // may have been set mid-loop by doAnswer(), which would cause
-            // unsigned subtraction underflow with the pre-captured 'now'.
-            unsigned long windowMs = (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
-            if (millis() - kaLastPingMs > windowMs) {
-                cliPrintln(F("KA timeout - no pings received"));
-                ledFlashER();
-                lastDisconnectMs = millis();
-                clearBuffers();
-                kaInitiator  = false;
-                kaMissed     = 0;
-                kaLastPingMs = 0;
-                state = S_IDLE;
-                openListenPipes();
-                sendNoCarrier();
-            }
-        } else if (!regS10) {
-            // S10=0 on answerer: reply to pings but never disconnect due to silence.
-            kaLastPingMs = 0;
         }
     }
-
-
 
     // ── 13. Radio health check (every 500 ms) ────────────────────────────────
     if (now - lastHealthMs >= HEALTH_INTERVAL_MS) {
