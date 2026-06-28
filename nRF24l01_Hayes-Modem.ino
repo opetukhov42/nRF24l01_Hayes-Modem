@@ -44,6 +44,8 @@
  *   ATSMYMAC?        – query own MAC
  *   ATSETCH=nn       – set RF channel 0-125 (default 97 = 2497 MHz, above WiFi+BT)
  *   ATSETCH?         – query RF channel
+ *   ATSETCHAUTO      – scan all channels and auto-select the quietest one (idle only)
+ *   ATRE             – re-dial last number (equivalent to ATD <last MAC>)
  *   ATSSPEED=n       – air data rate: 0=250 kbps, 1=1 Mbps (default), 2=2 Mbps
  *   ATSSPEED?        – query air data rate
  *   ATSBAUD=n        – set serial baud rate (2400/4800/9600/19200/38400/57600/
@@ -115,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.73.0"
+#define MODEM_VERSION "v1.74.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -226,6 +228,7 @@ uint8_t regS17       = 20;    // S17: spectrum scan dwell ms per channel (defaul
 uint8_t regS18       = 0;     // S18: silent mode 0=normal, 1=suppress all CLI output
 
 unsigned long lastDisconnectMs = 0;  // millis() of last disconnect — busy detect grace period
+unsigned long connectedAt      = 0;  // millis() when current connection was established
 
 // Data-loss counters (reset by ATI or AT&F)
 uint32_t txDropped   = 0;    // bytes dropped: serial→radio direction (host sent too fast)
@@ -849,6 +852,7 @@ void handleRadioPacket(const uint8_t *pkt) {
         case PKT_DISC:
             if (state == S_DATA || state == S_CONNECTED) {
                 lastDisconnectMs = millis();
+    connectedAt      = 0;
                 clearBuffers();
                 kaInitiator   = false;
                 kaMissed      = 0;
@@ -894,6 +898,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaMissed      = 0;
                 kaWaitingPong = false;
                 kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+                connectedAt   = millis();
                 sendConnect();           // print while still in CLI mode
                 state         = S_DATA;  // switch AFTER printing CONNECT
             }
@@ -1036,6 +1041,7 @@ void doAnswer() {
     kaWaitingPong = false;
     kaPingAt      = 0;      // answerer never initiates pings
     kaLastPingMs  = millis(); // arm watchdog from connect time
+    connectedAt   = millis();
     sendConnect();           // print while still in CLI mode
     state         = S_DATA;  // switch to data mode AFTER printing CONNECT
 }
@@ -1417,6 +1423,44 @@ void atPing(const uint8_t targetMac[3]) {
     sendOK();
 }
 
+// ── Channel auto-select ───────────────────────────────────────────────────────
+// Scans all 126 channels using S17 samples each, picks the one with the
+// lowest hit count (quietest), sets it as the active channel and saves to EEPROM.
+void autoSelectChannel() {
+    if (state != S_IDLE) {
+        Serial.print(F("\r\nERROR: ATSETCHAUTO only available when idle\r\n"));
+        return;
+    }
+    Serial.print(F("\r\nScanning channels"));
+    uint8_t  bestCh    = 0;
+    uint8_t  bestHits  = 255;
+    for (uint8_t ch = 0; ch < 126; ch++) {
+        uint8_t hits = 0;
+        for (uint8_t s = 0; s < regS17; s++) {
+            radio.setChannel(ch);
+            radio.stopListening();
+            delayMicroseconds(130);
+            radio.startListening();
+            delayMicroseconds(500);
+            if (radio.testRPD()) hits++;
+        }
+        if (hits < bestHits) { bestHits = hits; bestCh = ch; }
+        if (ch % 16 == 0) Serial.print(F("."));  // progress dots
+    }
+    channel = bestCh;
+    radio.setChannel(channel);
+    openListenPipes();
+    saveConfig();
+    Serial.print(F("\r\nBest channel: "));
+    Serial.print(channel);
+    Serial.print(F(" ("));
+    Serial.print(bestHits);
+    Serial.print(F("/"));
+    Serial.print(regS17);
+    Serial.println(F(" hits — saved)"));
+    sendOK();
+}
+
 // ── Command parser ────────────────────────────────────────────────────────────
 bool parseMac(const char *str, uint8_t mac[3]) {
     // Expects exactly 6 hex digits, e.g. "A1B2C3"
@@ -1474,6 +1518,15 @@ void processCommand(const char *cmd) {
         }
 
         Serial.print(F("Baud    : ")); Serial.println(baudTable[baudIdx]);
+        // Uptime
+        if (connectedAt > 0 && (state == S_DATA || state == S_CONNECTED)) {
+            unsigned long secs = (millis() - connectedAt) / 1000UL;
+            unsigned long h = secs / 3600, m = (secs % 3600) / 60, s = secs % 60;
+            Serial.print(F("Uptime  : "));
+            if (h) { Serial.print(h); Serial.print(F("h ")); }
+            if (h || m) { Serial.print(m); Serial.print(F("m ")); }
+            Serial.print(s); Serial.println(F("s"));
+        }
         Serial.print(F("State   : "));
         switch (state) {
             case S_IDLE:       Serial.println(F("IDLE"));                break;
@@ -1643,6 +1696,8 @@ void processCommand(const char *cmd) {
         sendOK();
         return;
     }
+    if (strcmp(uc, "ATSETCHAUTO") == 0) { autoSelectChannel(); return; }
+
     if (strncmp(uc, "ATSETCH=", 8) == 0) {
         int ch = atoi(uc + 8);
         if (ch >= 0 && ch <= 125) {
@@ -1939,6 +1994,13 @@ void processCommand(const char *cmd) {
         uint8_t mac[3];
         if (!parseMac(uc + 6, mac)) { sendError(); return; }
         atPing(mac);
+        return;
+    }
+
+    // ── ATRE — re-dial last number ───────────────────────────────────────────
+    if (strcmp(uc, "ATRE") == 0) {
+        if (lastDialStr[0] == '\0') { sendError(); return; }
+        processCommand(lastDialStr);
         return;
     }
 
