@@ -115,7 +115,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.71.0"
+#define MODEM_VERSION "v1.72.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -693,7 +693,8 @@ void flushTxBuffer() {
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
                 if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD ||
-                    pt == PKT_XON   || pt == PKT_XOFF) {
+                    pt == PKT_XON   || pt == PKT_XOFF ||
+                    pt == PKT_PING  || pt == PKT_PONG) {
                     handleRadioPacket(tmp);
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
@@ -744,7 +745,10 @@ void flushTxBuffer() {
                 if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
                     handleRadioPacket(tmp);
                     gotAck = true;
-                } else if (pt == PKT_XON || pt == PKT_XOFF) {
+                } else if (pt == PKT_XON  || pt == PKT_XOFF ||
+                           pt == PKT_PING || pt == PKT_PONG) {
+                    // Handle KA packets immediately — don't defer to pendingPkt
+                    // which may be full, causing silent discard and KA misses.
                     handleRadioPacket(tmp);
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
