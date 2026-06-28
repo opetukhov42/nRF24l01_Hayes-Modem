@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.75.1"
+#define MODEM_VERSION "v1.76.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -2162,8 +2162,24 @@ void loop() {
         }
     }
 
-    // ── 2. Read from serial (or feed test pattern if TX test active) ─────────
-    if (testTxActive && (state == S_DATA)) {
+    // ── 2. Read from serial (or feed/intercept for active tests) ─────────────
+    // RX test keypress must be caught here — before normal serial processing
+    // would consume and discard the byte as data, making stop unreliable.
+    if (testRxActive && Serial.available()) {
+        Serial.read();   // consume the keypress
+        while (rxAvail() > 0) { rxPop(); testRxBytes++; }
+        unsigned long elapsed = millis() - testStart;
+        uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
+        testRxPkts = testRxBytes / MAX_DATA;
+        Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
+        Serial.print(F("  bytes="));  Serial.print(testRxBytes);
+        Serial.print(F("  speed="));  Serial.print(speed);
+        Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
+        testRxActive = false;
+        state = S_CONNECTED;
+        kaResetWindow();
+        sendOK();
+    } else if (testTxActive && (state == S_DATA)) {
         // Keypress stops the TX test
         if (Serial.available()) {
             Serial.read();
@@ -2360,42 +2376,28 @@ void loop() {
         }
     }
 
-    // ── 6. Drain RX buffer → serial (or count+discard if RX test active) ─────
+    // ── 6. Drain RX buffer → serial (or discard if any test active) ──────────
     if (testRxActive) {
-        // Keypress stops RX test
-        if (Serial.available()) {
-            Serial.read();
-            // Drain any remaining bytes from rxBuf before printing final stats
-            while (rxAvail() > 0) { rxPop(); testRxBytes++; }
-            unsigned long elapsed = millis() - testStart;
-            uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
-            Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
-            Serial.print(F("  bytes="));  Serial.print(testRxBytes);
-            Serial.print(F("  speed="));  Serial.print(speed);
-            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
-            testRxActive = false;
-            state = S_CONNECTED;
-            kaResetWindow();
-            sendOK();
-        } else {
-            // Count and discard — do not print to serial
-            while (rxAvail() > 0) {
-                rxPop();
-                testRxBytes++;
-                testIBytes++;
-            }
-            // Periodic stats
-            unsigned long tnow = millis();
-            if (tnow - testLastStats >= TEST_STATS_MS) {
-                unsigned long elapsed = (tnow - testStart) / 1000UL;
-                Serial.print(F("[RX] t="));    Serial.print(elapsed);
-                Serial.print(F("s  pkts="));   Serial.print(testRxPkts);
-                Serial.print(F("  speed="));   Serial.print(testIBytes);
-                Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
-                testIBytes    = 0;
-                testLastStats = tnow;
-            }
+        // Count and discard — keypress handled in step 2
+        while (rxAvail() > 0) {
+            rxPop();
+            testRxBytes++;
+            testIBytes++;
         }
+        // Periodic stats
+        unsigned long tnow = millis();
+        if (tnow - testLastStats >= TEST_STATS_MS) {
+            unsigned long elapsed = (tnow - testStart) / 1000UL;
+            Serial.print(F("[RX] t="));    Serial.print(elapsed);
+            Serial.print(F("s  pkts="));   Serial.print(testRxPkts);
+            Serial.print(F("  speed="));   Serial.print(testIBytes);
+            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
+            testIBytes    = 0;
+            testLastStats = tnow;
+        }
+    } else if (testTxActive) {
+        // TX test active — discard inbound data (e.g. echo) silently
+        while (rxAvail() > 0) rxPop();
     } else {
         while (rxAvail() > 0) {
             int b = rxPop();
