@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.100.0"
+#define MODEM_VERSION "v1.102.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -273,6 +273,7 @@ bool hostXoffSent  = false;   // we told the host to stop
 bool radioXoffRecv  = false;  // remote told us to stop
 bool radioXoffSent  = false;  // we told remote to stop
 bool    yieldToRemote  = false;  // remote sent SWACK_YIELD — pause our TX, let them send
+bool    yieldGranted   = false;  // we sent SWACK_YIELD and remote is now in yield wait
 
 // Pending packet: flushTxBuffer's RX wait stores here to avoid re-entrant
 // handleRadioPacket() calls. Main loop drains it before radio.available().
@@ -707,18 +708,26 @@ static void buildTestPacket(uint8_t *buf, uint32_t counter) {
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
 
-    // pendingPong is delivered exclusively via swflowAckData (SWACK_YIELD).
-    // Sending it standalone here risks firing while TX is transmitting.
-    // swflowAckData guarantees TX is in its ACK wait (RX mode) when pong arrives.
+    // Send pong only after yield was granted — TX is now in its yield wait
+    // (50ms, RX mode) so the standalone send is guaranteed to be received.
+    if (pendingPong && yieldGranted) {
+        yieldGranted = false;
+        pendingPong  = false;
+        sendControlPacket(PKT_PONG);
+        return;
+    }
+    yieldGranted = false;   // clear if no pong to send
 
     if (radioXoffRecv) return;
 
     if (yieldToRemote) {
         yieldToRemote = false;
-        // Use a longer yield window when waiting for pong (must survive
-        // a full loop() round-trip on the remote side). For normal data
-        // yield, use a short window to avoid throttling throughput.
-        unsigned long yieldMs = kaWaitingPong ? 50UL : (unsigned long)SW_ACK_WAIT_MS * 2;
+        // Pong yield: 200ms ceiling — exits immediately on first packet received
+        // (gotPkt break), so normal case costs ~2-5ms not 200ms. The long
+        // ceiling only burns on a genuine pong loss (rare), costing ~200ms
+        // once per 5s = 4% overhead worst-case vs NO CARRIER without it.
+        // Data yield: 10ms — just enough for one loop() round-trip.
+        unsigned long yieldMs = kaWaitingPong ? 200UL : (unsigned long)SW_ACK_WAIT_MS * 2;
         unsigned long yieldEnd = millis() + yieldMs;
         bool gotPkt = false;
         while (millis() < yieldEnd) {
@@ -892,6 +901,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaPingAt      = 0;
                 kaLastPingMs  = 0;
                 yieldToRemote  = false;
+                yieldGranted   = false;
                 pendingPong    = false;
                 swLastPktValid = false;
                 rxLastSeq      = 0xFF;
@@ -1040,7 +1050,8 @@ bool swflowAckData(uint8_t seq) {
     ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
     openWritePipe(remoteMac);
     bool ok = radio.write(ack, PAYLOAD_SIZE);
-    if (ok) ledFlashSD(); else ledFlashER();
+    if (ok) { ledFlashSD(); if (haveData) yieldGranted = true; }
+    else ledFlashER();
     openListenPipes();
     return true;
 }
@@ -1663,6 +1674,7 @@ void processCommand(const char *cmd) {
         kaPingAt       = 0;
         kaLastPingMs   = 0;
         yieldToRemote  = false;
+        yieldGranted   = false;
         pendingPong    = false;
         swLastPktValid = false;
         rxLastSeq      = 0xFF;
