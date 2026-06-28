@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.85.0"
+#define MODEM_VERSION "v1.87.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -692,19 +692,23 @@ static void buildTestPacket(uint8_t *buf, uint32_t counter) {
 // Yield: PKT_SWACK_YIELD from receiver → wait for their packet, then return.
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
-    if (radioXoffRecv) return;
 
-    // Cooperative yield: remote requested TX window.
-    // Pending pong: send via yield mechanism before normal data
+    // Pong is a control packet — send regardless of XOFF flow control
     if (pendingPong) {
         pendingPong = false;
         sendControlPacket(PKT_PONG);
         return;
     }
 
+    if (radioXoffRecv) return;   // pause data TX only — pong already handled
+
     if (yieldToRemote) {
         yieldToRemote = false;
-        unsigned long yieldEnd = millis() + SW_ACK_WAIT_MS * 2;
+        // Wait up to 50ms for remote's packet after yielding.
+        // 50ms covers a full loop() round-trip including stats printing.
+        // Exit early once a packet arrives to minimise TX pause.
+        unsigned long yieldEnd = millis() + 50UL;
+        bool gotPkt = false;
         while (millis() < yieldEnd) {
             while (radio.available()) {
                 uint8_t tmp[PAYLOAD_SIZE];
@@ -714,11 +718,14 @@ void flushTxBuffer() {
                     pt == PKT_XON   || pt == PKT_XOFF ||
                     pt == PKT_PING  || pt == PKT_PONG) {
                     handleRadioPacket(tmp);
+                    gotPkt = true;
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
+                    gotPkt = true;
                 }
             }
+            if (gotPkt) break;
         }
         return;
     }
@@ -1000,9 +1007,9 @@ bool swflowAckData(uint8_t seq) {
 
     // Duplicate detection: if seq matches rxLastSeq (global, reset on connect).
     if (rxLastSeq != 0xFF && seq == rxLastSeq) {
-        // Re-send SWACK to unblock sender
+        // Re-send SWACK — pong bypasses XOFF.
         uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
-        bool haveData = ((txAvail() > 0) || pendingPong) && !radioXoffRecv;
+        bool haveData = (((txAvail() > 0) && !radioXoffRecv) || pendingPong);
         ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
         ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
         openWritePipe(remoteMac); radio.write(ack, PAYLOAD_SIZE);
@@ -1012,9 +1019,9 @@ bool swflowAckData(uint8_t seq) {
     }
     rxLastSeq = seq;
 
-    // In-order: send SWACK (with yield if we have data OR a pending pong)
+    // Yield if data queued OR pending pong — pong bypasses XOFF.
     uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
-    bool haveData = ((txAvail() > 0) || pendingPong) && !radioXoffRecv;
+    bool haveData = (((txAvail() > 0) && !radioXoffRecv) || pendingPong);
     ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
     ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
     openWritePipe(remoteMac);
