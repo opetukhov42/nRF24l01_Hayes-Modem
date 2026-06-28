@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.103.0"
+#define MODEM_VERSION "v1.105.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -708,13 +708,19 @@ static void buildTestPacket(uint8_t *buf, uint32_t counter) {
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
 
-    // Send pong only after yield was granted — TX is now in its yield wait
-    // (50ms, RX mode) so the standalone send is guaranteed to be received.
-    if (pendingPong && yieldGranted) {
-        yieldGranted = false;
-        pendingPong  = false;
-        sendControlPacket(PKT_PONG);
-        return;
+    // Pong delivery:
+    // S_CONNECTED or idle S_DATA (txBuf empty): remote is not flooding —
+    //   no collision risk, send pong directly.
+    // S_DATA with data flowing: remote is flooding — require yieldGranted to
+    //   confirm remote is in yield wait (RX mode) before sending.
+    if (pendingPong) {
+        bool remoteIdle = (state == S_CONNECTED) || (txAvail() == 0 && !yieldGranted);
+        if (remoteIdle || yieldGranted) {
+            yieldGranted = false;
+            pendingPong  = false;
+            sendControlPacket(PKT_PONG);
+            return;
+        }
     }
     yieldGranted = false;   // clear if no pong to send
 
