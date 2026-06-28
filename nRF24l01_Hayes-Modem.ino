@@ -66,6 +66,7 @@
  *   ATTEST-TX        – speed test TX: flood test pattern, print stats every 1 s
  *   ATTEST-RX        – speed test RX: receive and count bytes, print stats every 1 s
  *   ATTEST-ECHO      – speed test echo: reflect received packets back to sender
+ *   ATTEST-TXRX      – combined TX+RX test: run on both nodes simultaneously
  *
  * S-registers (ATSn=value to set, ATSn? to query; all saved to EEPROM):
  *   S0   auto-answer ring count (0=off, default 0)
@@ -117,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.93.0"
+#define MODEM_VERSION "v1.97.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -345,7 +346,19 @@ uint8_t  rxLastSeq   = 0xFF;    // last accepted PKT_DATA seq (0xFF = none yet)
 // ── Speed test mode (non-blocking, runs inside loop()) ───────────────────────
 bool     testTxActive   = false;
 bool     testRxActive   = false;
-bool     testEchoActive = false;
+bool     testEchoActive  = false;
+bool     testTxRxActive  = false;
+uint32_t testTxRxTxBytes = 0;   // bytes sent this session
+uint32_t testTxRxTxPkts  = 0;
+uint32_t testTxRxRxBytes = 0;   // bytes received this session
+uint32_t testTxRxRxPkts  = 0;
+uint32_t testTxRxITxBytes = 0;  // interval TX bytes
+uint32_t testTxRxIRxBytes = 0;  // interval RX bytes
+uint32_t testTxRxITxPkts  = 0;  // interval TX packets for retx%
+uint32_t testTxRxRetxBase= 0;
+uint32_t testTxRxIRetxBase=0;
+uint32_t testTxRxDropTxBase=0;
+uint32_t testTxRxDropRxBase=0;
 uint32_t testTxBytes    = 0;
 uint32_t testTxPkts     = 0;
 uint32_t testRxBytes    = 0;
@@ -616,10 +629,11 @@ void sendNoCarrier() {
     if (!regS18) Serial.print(F("\r\nNO CARRIER\r\n"));
     ledFlashER();
     // Stop any running test — connection is gone
-    if (testTxActive || testRxActive || testEchoActive) {
+    if (testTxActive || testRxActive || testEchoActive || testTxRxActive) {
         testTxActive   = false;
         testRxActive   = false;
         testEchoActive = false;
+        testTxRxActive = false;
         Serial.print(F("\r\n[TEST STOPPED - NO CARRIER]\r\n"));
     }
 }
@@ -668,22 +682,21 @@ bool sendControlPacket(uint8_t type) {
 // ── Speed test constants ──────────────────────────────────────────────────────
 #define TEST_STATS_MS  1000           // print stats every 1 s
 
-// Build one 29-byte test packet: "Test123_ NNNNNNNNNN\r\n          "
-// prefix(8) + 10-digit counter + CR LF + 9 spaces = 29 bytes exactly.
-// Counter wraps at 10^10 (harmless — visual indicator only).
+// Build one 29-byte test packet: "TestFromXXYYZZ_NNNNNNNNNN\r\n  "
+// "TestFrom"(8) + MAC(6) + "_"(1) + 10-digit counter(10) + CR LF(2) + 2 spaces = 29
 static void buildTestPacket(uint8_t *buf, uint32_t counter) {
-    // prefix
-    memcpy(buf, "Test123_", 8);
-    // 10-digit zero-padded decimal counter
-    uint32_t c = counter % 10000000000UL;   // keep 10 digits
-    for (int8_t d = 9; d >= 0; d--) {
-        buf[8 + d] = '0' + (c % 10);
-        c /= 10;
-    }
-    buf[18] = '\r';
-    buf[19] = '\n';
-    // pad remainder with spaces
-    memset(buf + 20, ' ', MAX_DATA - 20);
+    memcpy(buf, "TestFrom", 8);
+    // 6-char uppercase hex MAC
+    const char hex[] = "0123456789ABCDEF";
+    buf[8]  = hex[(ownMac[0] >> 4) & 0xF]; buf[9]  = hex[ownMac[0] & 0xF];
+    buf[10] = hex[(ownMac[1] >> 4) & 0xF]; buf[11] = hex[ownMac[1] & 0xF];
+    buf[12] = hex[(ownMac[2] >> 4) & 0xF]; buf[13] = hex[ownMac[2] & 0xF];
+    buf[14] = '_';
+    // 10-digit zero-padded counter
+    uint32_t c = counter % 10000000000UL;
+    for (int8_t d = 9; d >= 0; d--) { buf[15 + d] = '0' + (c % 10); c /= 10; }
+    buf[25] = '\r'; buf[26] = '\n';
+    buf[27] = ' ';  buf[28] = ' ';
 }
 
 // ── Send buffered TX data over the air ───────────────────────────────────────
@@ -1279,14 +1292,13 @@ bool channelIsBusy() {
 }
 
 // ── Speed test ───────────────────────────────────────────────────────────────
-// ATTEST-TX: flood PKT_DATA packets with embedded seq numbers to the remote.
-// ATTEST-RX: wait for the magic signature, then count received bytes/packets.
+// ATTEST-TX:   flood test pattern packets; count bytes/retx; any key stops.
+// ATTEST-RX:   count received bytes/packets; discard; any key stops.
+// ATTEST-ECHO: reflect received bytes back via txBuf; any key stops.
+// ATTEST-TXRX: run on both nodes — TX stream + RX count simultaneously.
 //
-// Test packet payload layout (29 bytes):
-//   [0..3]  uint32_t sequence number (little-endian, starts at 0)
-//   [4..7]  uint32_t magic 0xDEADBEEF  ← RX arms on first packet with this magic
-//   [8..28] 0xAA fill
-//
+// Packet format (29 bytes): "TestFromXXYYZZ_NNNNNNNNNN\r\n  "
+//   XXYYZZ = sender MAC hex, NNNNNNNNNN = 10-digit zero-padded counter
 
 void speedTestTX() {
     if (state != S_CONNECTED && state != S_DATA) {
@@ -1296,6 +1308,8 @@ void speedTestTX() {
     if (state == S_CONNECTED) state = S_DATA;
     testTxActive    = true;
     testRxActive    = false;
+    testEchoActive  = false;
+    testTxRxActive  = false;
     testTxBytes     = 0;
     testTxPkts      = 0;
     testTxRetxBase  = swRetxCount;
@@ -1318,6 +1332,8 @@ void speedTestRX() {
     if (state == S_CONNECTED) state = S_DATA;
     testRxActive    = true;
     testTxActive    = false;
+    testEchoActive  = false;
+    testTxRxActive  = false;
     testRxBytes     = 0;
     testRxPkts      = 0;
     testRxDropBase  = rxDropped;
@@ -1330,12 +1346,15 @@ void speedTestRX() {
 }
 
 void speedTestEcho() {
-    if (state != S_CONNECTED) {
-        Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
+    if (state != S_CONNECTED && state != S_DATA) {
+        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
         return;
     }
     if (state == S_CONNECTED) state = S_DATA;
     testEchoActive    = true;
+    testTxActive      = false;
+    testRxActive      = false;
+    testTxRxActive    = false;
     testEchoCount     = 0;
     testEchoICount    = 0;
     testEchoDropBase  = rxDropped;
@@ -1432,6 +1451,33 @@ void autoSelectChannel() {
     Serial.print(regS17);
     Serial.print(F(" hits — saved)\r\n"));
     sendOK();
+}
+
+// ── Combined TX+RX speed test ────────────────────────────────────────────────
+// ATTEST-TXRX: both sides run simultaneously — generates TX stream AND counts RX.
+// Run on both nodes at the same time. Any key stops. No coordination needed.
+void speedTestTxRx() {
+    if (state != S_CONNECTED && state != S_DATA) {
+        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
+        return;
+    }
+    if (state == S_CONNECTED) state = S_DATA;
+    testTxActive     = false;
+    testRxActive     = false;
+    testEchoActive   = false;
+    testTxRxActive   = true;
+    testTxRxTxBytes  = 0; testTxRxTxPkts  = 0;
+    testTxRxRxBytes  = 0; testTxRxRxPkts  = 0;
+    testTxRxITxBytes = 0; testTxRxIRxBytes = 0; testTxRxITxPkts = 0;
+    testTxRxRetxBase  = swRetxCount;
+    testTxRxIRetxBase = swRetxCount;
+    testTxRxDropTxBase = txDropped;
+    testTxRxDropRxBase = rxDropped;
+    testPktCounter = 0;
+    testStart      = millis();
+    testLastStats  = testStart;
+    kaResetWindow();
+    Serial.print(F("\r\nATTEST-TXRX: sending+receiving — any key to stop\r\n"));
 }
 
 // ── Command parser ────────────────────────────────────────────────────────────
@@ -1956,6 +2002,7 @@ void processCommand(const char *cmd) {
     if (strcmp(uc, "ATTEST-TX") == 0)   { speedTestTX();   return; }
     if (strcmp(uc, "ATTEST-RX") == 0)   { speedTestRX();   return; }
     if (strcmp(uc, "ATTEST-ECHO") == 0) { speedTestEcho(); return; }
+    if (strcmp(uc, "ATTEST-TXRX") == 0) { speedTestTxRx(); return; }
 
     // ── ATPING ──────────────────────────────────────────────────────────────
     // Only available from S_IDLE — no active or pending connection.
@@ -2135,7 +2182,7 @@ void loop() {
     // ── 2. Read from serial (or feed/intercept for active tests) ─────────────
     // RX test keypress must be caught here — before normal serial processing
     // would consume and discard the byte as data, making stop unreliable.
-    if ((testRxActive || testEchoActive) && Serial.available()) {
+    if ((testRxActive || testEchoActive || testTxRxActive) && Serial.available()) {
         Serial.read();   // consume the keypress
         if (testRxActive) {
             while (rxAvail() > 0) { rxPop(); testRxBytes++; }
@@ -2147,6 +2194,23 @@ void loop() {
             Serial.print(F("  avg="));  Serial.print(speed);
             Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
             testRxActive = false;
+        } else if (testTxRxActive) {
+            unsigned long elapsed = millis() - testStart;
+            unsigned long elapsedSec = elapsed / 1000UL;
+            uint32_t txSpd = elapsedSec ? (testTxRxTxBytes / elapsedSec) : 0;
+            uint32_t rxSpd = elapsedSec ? (testTxRxRxBytes / elapsedSec) : 0;
+            uint32_t retx  = swRetxCount - testTxRxRetxBase;
+            uint32_t retxPct = testTxRxTxPkts ? (retx * 100UL / testTxRxTxPkts) : 0;
+            Serial.print(F("\r\n[TXRX DONE] tx_pkts=")); Serial.print(testTxRxTxPkts);
+            Serial.print(F("  tx_avg=")); Serial.print(txSpd);
+            Serial.print(F(" B/s  retx=")); Serial.print(retx);
+            Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)  "));
+            Serial.print(F("rx_pkts=")); Serial.print(testTxRxRxPkts);
+            Serial.print(F("  rx_avg=")); Serial.print(rxSpd);
+            Serial.print(F(" B/s  drop=tx:")); Serial.print(txDropped - testTxRxDropTxBase);
+            Serial.print(F("/rx:")); Serial.println(rxDropped - testTxRxDropRxBase);
+            testTxRxActive = false;
+            clearBuffers();
         } else {
             unsigned long elapsed = millis() - testStart;
             unsigned long elapsedSec = elapsed / 1000UL;
@@ -2160,6 +2224,47 @@ void loop() {
         state = S_CONNECTED;
         kaResetWindow();
         sendOK();
+    } else if (testTxRxActive && (state == S_DATA)) {
+        // TXRX: fill txBuf with test pattern (same as ATTEST-TX)
+        if (!radioXoffRecv && !yieldToRemote) {
+            while (txAvail() < (TX_BUF_SIZE / 2)) {
+                uint8_t payload[MAX_DATA];
+                buildTestPacket(payload, testPktCounter);
+                for (uint8_t i = 0; i < MAX_DATA; i++) txPush(payload[i]);
+                testTxRxTxBytes  += MAX_DATA;
+                testTxRxTxPkts++;
+                testTxRxITxBytes += MAX_DATA;
+                testTxRxITxPkts++;
+                testPktCounter++;
+            }
+        }
+        // Periodic stats
+        unsigned long tnow = millis();
+        if (tnow - testLastStats >= TEST_STATS_MS) {
+            unsigned long elapsed = (tnow - testStart) / 1000UL;
+            uint32_t iRetx   = swRetxCount - testTxRxIRetxBase;
+            uint32_t retxPct = testTxRxITxPkts ? (iRetx * 100UL / testTxRxITxPkts) : 0;
+            Serial.print(F("[TXRX] t="));     Serial.print(elapsed);
+            Serial.print(F("s  tx="));         Serial.print(testTxRxTxPkts);
+            Serial.print(F("pk  "));           Serial.print(testTxRxITxBytes);
+            Serial.print(F("B/s  retx="));     Serial.print(iRetx);
+            Serial.print(F("(")); Serial.print(retxPct); Serial.print(F("%)"));
+            Serial.print(F("  rx="));          Serial.print(testTxRxRxPkts);
+            Serial.print(F("pk  "));           Serial.print(testTxRxIRxBytes);
+            Serial.print(F("B/s  drop=tx:")); Serial.print(txDropped - testTxRxDropTxBase);
+            Serial.print(F("/rx:"));           Serial.print(rxDropped - testTxRxDropRxBase);
+            Serial.print(F("  KA:"));
+            if (kaLastSentMs && (millis() - kaLastSentMs) < TEST_STATS_MS) Serial.print(F("sent "));
+            if (kaLastRcvdMs && (millis() - kaLastRcvdMs) < TEST_STATS_MS) Serial.print(F("rcvd "));
+            if (kaMissed == 0 && !kaWaitingPong) Serial.println(F("OK"));
+            else if (kaMissed == 0) Serial.println(F("wait"));
+            else { Serial.print(F("miss ")); Serial.print(kaMissed); Serial.print(F("/")); Serial.println(regS12); }
+            testTxRxITxBytes  = 0;
+            testTxRxIRxBytes  = 0;
+            testTxRxITxPkts   = 0;
+            testTxRxIRetxBase = swRetxCount;
+            testLastStats = tnow;
+        }
     } else if (testTxActive && (state == S_DATA)) {
         // Keypress stops the TX test
         if (Serial.available()) {
@@ -2361,8 +2466,9 @@ void loop() {
     if (radio.available()) {
         uint8_t pkt[PAYLOAD_SIZE];
         radio.read(pkt, PAYLOAD_SIZE);
-        if (testRxActive  && pkt[0] == PKT_DATA) testRxPkts++;
+        if (testRxActive   && pkt[0] == PKT_DATA) testRxPkts++;
         if (testEchoActive && pkt[0] == PKT_DATA) { testEchoCount++; testEchoICount++; }
+        if (testTxRxActive && pkt[0] == PKT_DATA) { testTxRxRxPkts++; }
         if (flowMode == 0 && (state == S_DATA || state == S_CONNECTED)) {
             ledFlashRD();
             for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
@@ -2411,6 +2517,13 @@ void loop() {
             }
             testIBytes    = 0;
             testLastStats = tnow;
+        }
+    } else if (testTxRxActive) {
+        // Count and discard incoming (from remote's TXRX stream)
+        while (rxAvail() > 0) {
+            rxPop();
+            testTxRxRxBytes++;
+            testTxRxIRxBytes++;
         }
     } else if (testEchoActive) {
         // Echo mode: reflect received bytes back via txBuf,
