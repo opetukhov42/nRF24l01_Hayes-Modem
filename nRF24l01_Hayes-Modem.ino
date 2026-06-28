@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.87.0"
+#define MODEM_VERSION "v1.90.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -693,10 +693,13 @@ static void buildTestPacket(uint8_t *buf, uint32_t counter) {
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
 
-    // Pong is a control packet — send regardless of XOFF flow control
+    // Pong is a control packet — send regardless of XOFF flow control.
     if (pendingPong) {
         pendingPong = false;
-        sendControlPacket(PKT_PONG);
+        for (uint8_t _p = 0; _p < 3; _p++) {
+            sendControlPacket(PKT_PONG);
+            delay(2);
+        }
         return;
     }
 
@@ -704,10 +707,11 @@ void flushTxBuffer() {
 
     if (yieldToRemote) {
         yieldToRemote = false;
-        // Wait up to 50ms for remote's packet after yielding.
-        // 50ms covers a full loop() round-trip including stats printing.
-        // Exit early once a packet arrives to minimise TX pause.
-        unsigned long yieldEnd = millis() + 50UL;
+        // Use a longer yield window when waiting for pong (must survive
+        // a full loop() round-trip on the remote side). For normal data
+        // yield, use a short window to avoid throttling throughput.
+        unsigned long yieldMs = kaWaitingPong ? 50UL : (unsigned long)SW_ACK_WAIT_MS * 2;
+        unsigned long yieldEnd = millis() + yieldMs;
         bool gotPkt = false;
         while (millis() < yieldEnd) {
             while (radio.available()) {
@@ -2186,16 +2190,19 @@ void loop() {
                     testPktCounter++;
                 }
             } else {
-                // SWFLOW/HWACK: fill txBuf up to half capacity
-                while (txAvail() < (TX_BUF_SIZE / 2)) {
-                    uint8_t payload[MAX_DATA];
-                    buildTestPacket(payload, testPktCounter);
-                    for (uint8_t i = 0; i < MAX_DATA; i++) txPush(payload[i]);
-                    testTxBytes += MAX_DATA;
-                    testTxPkts++;
-                    testIBytes  += MAX_DATA;
-                    testIPkts++;
-                    testPktCounter++;
+                // SWFLOW/HWACK: fill txBuf up to half capacity,
+                // but honour XOFF from remote — pause like a real serial device.
+                if (!radioXoffRecv) {
+                    while (txAvail() < (TX_BUF_SIZE / 2)) {
+                        uint8_t payload[MAX_DATA];
+                        buildTestPacket(payload, testPktCounter);
+                        for (uint8_t i = 0; i < MAX_DATA; i++) txPush(payload[i]);
+                        testTxBytes += MAX_DATA;
+                        testTxPkts++;
+                        testIBytes  += MAX_DATA;
+                        testIPkts++;
+                        testPktCounter++;
+                    }
                 }
             }
             // Periodic stats
@@ -2403,10 +2410,14 @@ void loop() {
             testLastStats = tnow;
         }
     } else if (testEchoActive) {
-        // Echo mode: reflect received bytes back via txBuf
-        while (rxAvail() > 0) {
-            int b = rxPop();
-            if (b >= 0) txPush((uint8_t)b);
+        // Echo mode: reflect received bytes back via txBuf,
+        // honouring XOFF — don't push if remote asked us to stop
+        // or if txBuf is nearly full (avoids drop and lets flushTxBuffer drain first).
+        if (!radioXoffRecv && txAvail() < (TX_BUF_SIZE * 3 / 4)) {
+            while (rxAvail() > 0) {
+                int b = rxPop();
+                if (b >= 0) txPush((uint8_t)b);
+            }
         }
         // Periodic stats
         unsigned long tnow = millis();
