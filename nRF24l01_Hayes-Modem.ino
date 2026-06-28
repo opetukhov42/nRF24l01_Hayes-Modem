@@ -115,7 +115,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.68.0"
+#define MODEM_VERSION "v1.70.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -602,7 +602,16 @@ int8_t readRSSI() {
 // ── Response helpers ──────────────────────────────────────────────────────────
 void sendOK()        { if (!regS18) Serial.print(F("\r\nOK\r\n")); }
 void sendError()     { if (!regS18) Serial.print(F("\r\nERROR\r\n")); }
-void sendNoCarrier() { if (!regS18) Serial.print(F("\r\nNO CARRIER\r\n")); ledFlashER(); }
+void sendNoCarrier() {
+    if (!regS18) Serial.print(F("\r\nNO CARRIER\r\n"));
+    ledFlashER();
+    // Stop any running test — connection is gone
+    if (testTxActive || testRxActive) {
+        testTxActive = false;
+        testRxActive = false;
+        Serial.print(F("\r\n[TEST STOPPED - NO CARRIER]\r\n"));
+    }
+}
 void sendConnect()   { if (!regS18) Serial.print(F("\r\nCONNECT\r\n")); }
 void sendRing()      { if (!regS18) Serial.print(F("\r\nRING\r\n")); }
 
@@ -992,6 +1001,17 @@ bool swflowAckData(uint8_t seq) {
 }
 
 
+// ── KA window reset ─────────────────────────────────────────────────────────
+// Call on every S_DATA <-> S_CONNECTED transition so KA always starts with
+// a clean full window regardless of time spent in the previous state.
+void kaResetWindow() {
+    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+    kaWaitingPong = false;
+    kaMissed      = 0;
+    if (!kaInitiator)
+        kaLastPingMs = millis();
+}
+
 // Complete an incoming call: copy pending MAC, ACK the caller, enter DATA mode.
 void doAnswer() {
     memcpy(remoteMac, pendingMac, 3);
@@ -1250,6 +1270,7 @@ void speedTestTX() {
     testPktCounter  = 0;
     testStart       = millis();
     testLastStats   = testStart;
+    kaResetWindow();
     Serial.print(F("\r\nATTEST-TX: sending — any key to stop\r\n"));
 }
 
@@ -1268,6 +1289,7 @@ void speedTestRX() {
     testIPkts       = 0;
     testStart       = millis();
     testLastStats   = testStart;
+    kaResetWindow();
     Serial.print(F("\r\nATTEST-RX: receiving — any key to stop\r\n"));
 }
 
@@ -1335,11 +1357,8 @@ void speedTestEcho() {
     // Reset KA timers and return to CLI
     pendingPktReady = false;
     clearBuffers();
-    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
-    kaLastPingMs  = millis();
-    kaMissed      = 0;
-    kaWaitingPong = false;
     state = S_CONNECTED;
+    kaResetWindow();
     sendOK();
 }
 
@@ -1540,10 +1559,7 @@ void processCommand(const char *cmd) {
     if (strcmp(uc, "ATO") == 0 || strcmp(uc, "ATO0") == 0) {
         if (state == S_CONNECTED) {
             state = S_DATA;
-            // Refresh KA watchdog — remote may not have sent pings while
-            // we were in CLI mode, so give a full fresh window from now.
-            if (!kaInitiator)
-                kaLastPingMs = millis() + (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
+            kaResetWindow();
             sendConnect();
         } else if (state == S_DATA) {
             sendConnect();   // already in data mode
@@ -2094,10 +2110,7 @@ void loop() {
             Serial.print(F("  drop="));  Serial.println(txDropped - testTxDropBase);
             testTxActive = false;
             state = S_CONNECTED;
-            kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
-            kaLastPingMs  = millis() + (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
-            kaMissed      = 0;
-            kaWaitingPong = false;
+            kaResetWindow();
             sendOK();
         } else {
             if (flowMode == 0) {
@@ -2195,9 +2208,10 @@ void loop() {
     // ── 3. Escape post-guard ─────────────────────────────────────────────────
     if (plusCount == 255 && (now - lastDataMs) >= 1000) {
         // Confirmed escape
-        state = S_CONNECTED;   // stay connected but enter command mode
+        state = S_CONNECTED;
         plusCount = 0;
         escapeArmed = false;
+        kaResetWindow();
         Serial.println();
         sendOK();
     }
@@ -2294,10 +2308,7 @@ void loop() {
             Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
             testRxActive = false;
             state = S_CONNECTED;
-            kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
-            kaLastPingMs  = millis() + (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
-            kaMissed      = 0;
-            kaWaitingPong = false;
+            kaResetWindow();
             sendOK();
         } else {
             // Count and discard — do not print to serial
