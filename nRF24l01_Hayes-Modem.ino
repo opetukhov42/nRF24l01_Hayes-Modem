@@ -115,7 +115,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.70.0"
+#define MODEM_VERSION "v1.71.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -2278,12 +2278,11 @@ void loop() {
     if (radio.available()) {
         uint8_t pkt[PAYLOAD_SIZE];
         radio.read(pkt, PAYLOAD_SIZE);
+        if (testRxActive && pkt[0] == PKT_DATA) testRxPkts++;
         if (flowMode == 0 && (state == S_DATA || state == S_CONNECTED)) {
-            // Transparent mode: dump all bytes straight to serial.
-            // The application owns framing/length — we write all PAYLOAD_SIZE bytes.
             ledFlashRD();
             for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
-                if (regS13 == 1 && (pkt[i] == 0x11 || pkt[i] == 0x13)) continue; // honour XON/XOFF filter
+                if (regS13 == 1 && (pkt[i] == 0x11 || pkt[i] == 0x13)) continue;
                 if (!rxPush(pkt[i])) { rxDropped++; ledFlashER(); }
             }
             checkFlowControl();
@@ -2301,7 +2300,6 @@ void loop() {
             while (rxAvail() > 0) { rxPop(); testRxBytes++; }
             unsigned long elapsed = millis() - testStart;
             uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
-            testRxPkts = testRxBytes / MAX_DATA;
             Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
             Serial.print(F("  bytes="));  Serial.print(testRxBytes);
             Serial.print(F("  speed="));  Serial.print(speed);
@@ -2321,7 +2319,6 @@ void loop() {
             unsigned long tnow = millis();
             if (tnow - testLastStats >= TEST_STATS_MS) {
                 unsigned long elapsed = (tnow - testStart) / 1000UL;
-                testRxPkts = testRxBytes / MAX_DATA;
                 Serial.print(F("[RX] t="));    Serial.print(elapsed);
                 Serial.print(F("s  pkts="));   Serial.print(testRxPkts);
                 Serial.print(F("  speed="));   Serial.print(testIBytes);
