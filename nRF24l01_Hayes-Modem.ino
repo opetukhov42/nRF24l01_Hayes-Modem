@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.105.0"
+#define MODEM_VERSION "v1.110.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -245,6 +245,7 @@ unsigned long kaLastSentMs  = 0;     // millis() of last PKT_PING sent (initiato
 unsigned long kaLastRcvdMs  = 0;     // millis() of last PKT_PING received (answerer)
 unsigned long kaLastPongMs  = 0;     // millis() of last PKT_PONG received (initiator)
 bool          pendingPong    = false; // send PKT_PONG via yield path on next flushTxBuffer
+bool          pendingPing    = false; // send PKT_PING via yield — set by KA tick
 
 // Dial retry state (managed by the connect-timeout block in loop())
 uint32_t dialRetryCount  = 0;          // retries fired so far (uint32 for forever mode)
@@ -708,19 +709,35 @@ static void buildTestPacket(uint8_t *buf, uint32_t counter) {
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
 
+    // Ping delivery:
+    // a) yieldGranted: we are the data receiver — remote is in yield wait (RX).
+    //    Send ping into that guaranteed window.
+    // b) We are the data sender (txBuf has data) — remote is in its 5ms ACK
+    //    wait after receiving our last packet, radio in RX mode. Send ping
+    //    directly before the next data packet (brief self-pause).
+    // Ping: yield-governed when flooding (yieldGranted = remote in yield wait).
+    // Direct send when idle (txBuf empty = no collision risk).
+    if (pendingPing && (yieldGranted || txAvail() == 0)) {
+        yieldGranted  = false;
+        pendingPing   = false;
+        sendControlPacket(PKT_PING);
+        kaLastSentMs  = millis();
+        return;
+    }
+
     // Pong delivery:
     // S_CONNECTED or idle S_DATA (txBuf empty): remote is not flooding —
     //   no collision risk, send pong directly.
     // S_DATA with data flowing: remote is flooding — require yieldGranted to
     //   confirm remote is in yield wait (RX mode) before sending.
-    if (pendingPong) {
-        bool remoteIdle = (state == S_CONNECTED) || (txAvail() == 0 && !yieldGranted);
-        if (remoteIdle || yieldGranted) {
-            yieldGranted = false;
-            pendingPong  = false;
-            sendControlPacket(PKT_PONG);
-            return;
-        }
+    // Pong delivery: only when yieldGranted — remote is in yield wait (RX mode).
+    // Pong: send when yieldGranted (remote in yield wait) or no data flowing.
+    if (pendingPong && (yieldGranted || txAvail() == 0)) {
+        yieldGranted  = false;
+        pendingPong   = false;
+        pendingPongMs = 0;
+        sendControlPacket(PKT_PONG);
+        return;
     }
     yieldGranted = false;   // clear if no pong to send
 
@@ -728,12 +745,7 @@ void flushTxBuffer() {
 
     if (yieldToRemote) {
         yieldToRemote = false;
-        // Pong yield: 200ms ceiling — exits immediately on first packet received
-        // (gotPkt break), so normal case costs ~2-5ms not 200ms. The long
-        // ceiling only burns on a genuine pong loss (rare), costing ~200ms
-        // once per 5s = 4% overhead worst-case vs NO CARRIER without it.
-        // Data yield: 10ms — just enough for one loop() round-trip.
-        unsigned long yieldMs = kaWaitingPong ? 200UL : (unsigned long)SW_ACK_WAIT_MS * 2;
+        unsigned long yieldMs = (unsigned long)SW_ACK_WAIT_MS * 2;
         unsigned long yieldEnd = millis() + yieldMs;
         bool gotPkt = false;
         while (millis() < yieldEnd) {
@@ -909,6 +921,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 yieldToRemote  = false;
                 yieldGranted   = false;
                 pendingPong    = false;
+                pendingPongMs  = 0;
                 swLastPktValid = false;
                 rxLastSeq      = 0xFF;
                 radioXoffRecv  = false;
@@ -966,7 +979,8 @@ void handleRadioPacket(const uint8_t *pkt) {
                     kaLastPingMs = millis();
                 // Queue pong via yield path — swflowAckData yields when
                 // pendingPong is set, giving us a TX window to send it.
-                pendingPong = true;
+                pendingPong   = true;
+                pendingPongMs = millis();
             }
             break;
 
@@ -975,6 +989,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaMissed      = 0;
                 kaWaitingPong = false;
                 kaLastPongMs  = millis();
+                pendingPing   = false;
             }
             break;
 
@@ -1039,7 +1054,7 @@ bool swflowAckData(uint8_t seq) {
     if (rxLastSeq != 0xFF && seq == rxLastSeq) {
         // Re-send SWACK — pong bypasses XOFF.
         uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
-        bool haveData = (((txAvail() > 0) && !radioXoffRecv) || pendingPong);
+        bool haveData = (((txAvail() > 0) && !radioXoffRecv) || pendingPong || pendingPing);
         ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
         ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
         openWritePipe(remoteMac); radio.write(ack, PAYLOAD_SIZE);
@@ -1051,7 +1066,7 @@ bool swflowAckData(uint8_t seq) {
 
     // Yield if data queued OR pending pong — pong bypasses XOFF.
     uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
-    bool haveData = (((txAvail() > 0) && !radioXoffRecv) || pendingPong);
+    bool haveData = (((txAvail() > 0) && !radioXoffRecv) || pendingPong || pendingPing);
     ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
     ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
     openWritePipe(remoteMac);
@@ -1070,6 +1085,7 @@ void kaResetWindow() {
     kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
     kaWaitingPong = false;
     kaMissed      = 0;
+    pendingPing   = false;
     if (!kaInitiator)
         kaLastPingMs = millis();
 }
@@ -1682,6 +1698,7 @@ void processCommand(const char *cmd) {
         yieldToRemote  = false;
         yieldGranted   = false;
         pendingPong    = false;
+        pendingPongMs  = 0;
         swLastPktValid = false;
         rxLastSeq      = 0xFF;
         if (state == S_RINGING) {
@@ -2636,6 +2653,7 @@ void loop() {
 
         if (now >= kaPingAt) {
             if (kaWaitingPong) {
+                // Full S11 window elapsed with no pong — count as miss
                 kaMissed++;
                 cliPrint(F("KA miss "));
                 cliPrint(kaMissed);
@@ -2653,13 +2671,11 @@ void loop() {
                     openListenPipes();
                     sendNoCarrier();
                 } else {
-                    sendControlPacket(PKT_PING);
-                    kaLastSentMs = millis();
-                    kaPingAt = now + (unsigned long)regS11 * 1000UL;
+                    pendingPing   = true;
+                    kaPingAt      = now + (unsigned long)regS11 * 1000UL;
                 }
             } else {
-                sendControlPacket(PKT_PING);
-                kaLastSentMs  = millis();
+                pendingPing   = true;
                 kaWaitingPong = true;
                 kaPingAt      = now + (unsigned long)regS11 * 1000UL;
             }
