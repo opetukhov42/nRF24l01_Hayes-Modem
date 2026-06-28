@@ -245,6 +245,7 @@ unsigned long kaLastSentMs  = 0;     // millis() of last PKT_PING sent (initiato
 unsigned long kaLastRcvdMs  = 0;     // millis() of last PKT_PING received (answerer)
 unsigned long kaLastPongMs  = 0;     // millis() of last PKT_PONG received (initiator)
 bool          pendingPong    = false; // send PKT_PONG via yield path on next flushTxBuffer
+unsigned long pendingPongMs  = 0;     // millis() when pendingPong was set
 bool          pendingPing    = false; // send PKT_PING via yield — set by KA tick
 
 // Dial retry state (managed by the connect-timeout block in loop())
