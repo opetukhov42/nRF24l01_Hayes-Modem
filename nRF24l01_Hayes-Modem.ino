@@ -115,7 +115,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.72.0"
+#define MODEM_VERSION "v1.73.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -2395,11 +2395,33 @@ void loop() {
                 } else {
                     sendControlPacket(PKT_PING);
                     kaPingAt = now + (unsigned long)regS11 * 1000UL;
+                    // Brief listen window for pong
+                    unsigned long pongWait = millis() + SW_ACK_WAIT_MS * 4;
+                    while (millis() < pongWait) {
+                        if (radio.available()) {
+                            uint8_t tmp[PAYLOAD_SIZE];
+                            radio.read(tmp, PAYLOAD_SIZE);
+                            handleRadioPacket(tmp);
+                            if (!kaWaitingPong) break;
+                        }
+                    }
                 }
             } else {
                 sendControlPacket(PKT_PING);
                 kaWaitingPong = true;
                 kaPingAt      = now + (unsigned long)regS11 * 1000UL;
+                // Brief listen window for pong — radio is in RX after
+                // sendControlPacket but flushTxBuffer will immediately
+                // switch to TX again; give pong a chance to arrive.
+                unsigned long pongWait = millis() + SW_ACK_WAIT_MS * 4;
+                while (millis() < pongWait) {
+                    if (radio.available()) {
+                        uint8_t tmp[PAYLOAD_SIZE];
+                        radio.read(tmp, PAYLOAD_SIZE);
+                        handleRadioPacket(tmp);
+                        if (!kaWaitingPong) break;  // got pong
+                    }
+                }
             }
         }
     } else if (!kaInitiator && (state == S_DATA || state == S_CONNECTED)) {
