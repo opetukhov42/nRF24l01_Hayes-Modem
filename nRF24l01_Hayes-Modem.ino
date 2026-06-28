@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.116.0"
+#define MODEM_VERSION "v1.117.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -701,6 +701,12 @@ bool sendDirectCtrl(uint8_t type) {
     return ok;
 }
 
+static void errMustBeConnected() {
+    Serial.print(F("
+ERROR: must be connected (use ATD then +++ first)
+"));
+}
+
 // ── Speed test constants ──────────────────────────────────────────────────────
 #define TEST_STATS_MS  1000           // print stats every 1 s
 
@@ -1000,11 +1006,6 @@ void handleRadioPacket(const uint8_t *pkt) {
             }
             break;
 
-        case PKT_NACK:
-            // NACK not used in stop-and-wait mode; retransmit is handled
-            // by the SW_ACK_WAIT timeout in flushTxBuffer.
-            break;
-
         case PKT_PING:
             if (state == S_DATA || state == S_CONNECTED) {
                 kaLastRcvdMs = millis();
@@ -1243,7 +1244,7 @@ void spectrumScan() {
 
     Serial.println(F("SPECTRUM SCAN — any key to stop"));
     Serial.println(F("Ch:  0         1         2         3         4         5         6         7         8         9         10        11        12"));
-    Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
+    printSpectrumRuler();
 
     // Density to ASCII lookup
     static const char density[] = " .:-=+*#@%";
@@ -1295,9 +1296,9 @@ void spectrumScan() {
         // Print footer ruler every 40 sweeps so the scale is always visible.
         if (sweepCount >= 40) {
             sweepCount = 0;
-            Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
+            printSpectrumRuler();
             Serial.println(F("Ch:  0         1         2         3         4         5         6         7         8         9         10        11        12"));
-            Serial.println(F("     0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456"));
+            printSpectrumRuler();
         }
     }
 
@@ -1361,8 +1362,7 @@ bool channelIsBusy() {
 
 void speedTestTX() {
     if (state != S_CONNECTED && state != S_DATA) {
-        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
-        return;
+        errMustBeConnected(); return;
     }
     if (state == S_CONNECTED) state = S_DATA;
     testTxActive    = true;
@@ -1385,8 +1385,7 @@ void speedTestTX() {
 
 void speedTestRX() {
     if (state != S_CONNECTED && state != S_DATA) {
-        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
-        return;
+        errMustBeConnected(); return;
     }
     if (state == S_CONNECTED) state = S_DATA;
     testRxActive    = true;
@@ -1406,8 +1405,7 @@ void speedTestRX() {
 
 void speedTestEcho() {
     if (state != S_CONNECTED && state != S_DATA) {
-        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
-        return;
+        errMustBeConnected(); return;
     }
     if (state == S_CONNECTED) state = S_DATA;
     testEchoActive    = true;
@@ -1517,8 +1515,7 @@ void autoSelectChannel() {
 // Run on both nodes at the same time. Any key stops. No coordination needed.
 void speedTestTxRx() {
     if (state != S_CONNECTED && state != S_DATA) {
-        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
-        return;
+        errMustBeConnected(); return;
     }
     if (state == S_CONNECTED) state = S_DATA;
     testTxActive     = false;
@@ -1650,7 +1647,7 @@ void processCommand(const char *cmd) {
         Serial.print(F("S18     : ")); Serial.println(regS18 == 1 ? F("1 (silent mode ON)") : F("0 (normal output)"));
         Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (serial->radio, host overflow)"));
         Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (radio->serial, radio overflow)"));
-        if (txDropped || rxDropped) Serial.println(F("** DATA LOSS DETECTED — consider enabling XON/XOFF (ATS13=1) **"));
+        if (txDropped || rxDropped) Serial.println(F("** DATA LOSS: enable XON/XOFF (ATS13=1) **"));
         txDropped = 0;  // reset after display
         rxDropped = 0;
         if (state == S_DATA || state == S_CONNECTED) {
