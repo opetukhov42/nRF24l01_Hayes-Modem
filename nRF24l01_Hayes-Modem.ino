@@ -115,7 +115,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.63.1"
+#define MODEM_VERSION "v1.68.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -335,6 +335,23 @@ bool     escapeArmed = false;    // true after first guard silence
 
 // SWFLOW duplicate detection
 uint8_t  rxLastSeq   = 0xFF;    // last accepted PKT_DATA seq (0xFF = none yet)
+
+// ── Speed test mode (non-blocking, runs inside loop()) ───────────────────────
+bool     testTxActive   = false;
+bool     testRxActive   = false;
+uint32_t testTxBytes    = 0;
+uint32_t testTxPkts     = 0;
+uint32_t testRxBytes    = 0;
+uint32_t testRxPkts     = 0;
+uint32_t testIBytes     = 0;    // bytes in current 1-second interval
+uint32_t testIPkts      = 0;    // packets in current 1-second interval
+uint32_t testIRetxBase  = 0;    // retx baseline for current interval
+uint32_t testTxRetxBase = 0;    // retx baseline for whole TX test
+uint32_t testTxDropBase = 0;
+uint32_t testRxDropBase = 0;
+uint32_t testPktCounter = 0;    // incrementing counter for buildTestPacket
+unsigned long testStart     = 0;
+unsigned long testLastStats = 0;
 
 
 // ── LED helpers ───────────────────────────────────────────────────────────────
@@ -779,6 +796,10 @@ void handleRadioPacket(const uint8_t *pkt) {
                     }
                     checkFlowControl();
                 }
+                // Receiving data proves the link is alive — reset answerer
+                // KA watchdog so active data flow prevents false NO CARRIER.
+                if (!kaInitiator && regS10 && kaLastPingMs != 0)
+                    kaLastPingMs = millis();
             } else if (state == S_CONNECTED) {
                 // CLI mode: remote may still be sending — ACK to keep
                 // stop-and-wait flowing but discard data (not in data mode).
@@ -871,16 +892,20 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_PING:
-            // Always reply regardless of S10 setting.
-            sendControlPacket(PKT_PONG);
-            // If S10=1 and we are the answerer, record arrival time for watchdog.
-            if (regS10 && !kaInitiator)
-                kaLastPingMs = millis();
+            // Only reply when we have an active connection — replying from
+            // S_IDLE would keep the remote's KA alive after we've disconnected.
+            if (state == S_DATA || state == S_CONNECTED) {
+                sendControlPacket(PKT_PONG);
+                if (regS10 && !kaInitiator)
+                    kaLastPingMs = millis();
+            }
             break;
 
         case PKT_PONG:
-            kaMissed      = 0;
-            kaWaitingPong = false;
+            if (state == S_DATA || state == S_CONNECTED) {
+                kaMissed      = 0;
+                kaWaitingPong = false;
+            }
             break;
 
         case PKT_DIAG_PING:
@@ -1208,140 +1233,42 @@ bool channelIsBusy() {
 //
 
 void speedTestTX() {
-    if (state != S_CONNECTED) {
-        Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
+    if (state != S_CONNECTED && state != S_DATA) {
+        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
         return;
     }
+    if (state == S_CONNECTED) state = S_DATA;
+    testTxActive    = true;
+    testRxActive    = false;
+    testTxBytes     = 0;
+    testTxPkts      = 0;
+    testTxRetxBase  = swRetxCount;
+    testTxDropBase  = txDropped;
+    testIBytes      = 0;
+    testIPkts       = 0;
+    testIRetxBase   = swRetxCount;
+    testPktCounter  = 0;
+    testStart       = millis();
+    testLastStats   = testStart;
     Serial.print(F("\r\nATTEST-TX: sending — any key to stop\r\n"));
-
-    uint32_t totalBytes = 0;
-    uint32_t pktCount   = 0;
-    uint32_t retxStart  = swRetxCount;
-    uint32_t dropStart  = txDropped;
-    unsigned long testStart = millis();
-    unsigned long lastStats = testStart;
-
-    state = S_DATA;
-
-    while (true) {
-        if (Serial.available()) { Serial.read(); break; }
-
-        // Build and send one test packet with incrementing counter
-        uint8_t payload[MAX_DATA];
-        buildTestPacket(payload, pktCount);
-        for (uint8_t i = 0; i < MAX_DATA; i++) txPush(payload[i]);
-        flushTxBuffer();
-        totalBytes += MAX_DATA;
-        pktCount++;
-
-        // Discard any inbound data (e.g. echo) during test
-        if (pendingPktReady) { pendingPktReady = false; }
-
-        unsigned long now = millis();
-        if (now - lastStats >= TEST_STATS_MS) {
-            unsigned long elapsed = (now - testStart) / 1000UL;
-            uint32_t speed  = elapsed ? (totalBytes / elapsed) : totalBytes;
-            uint32_t retx   = swRetxCount - retxStart;
-            uint32_t retxPct = pktCount ? (retx * 100UL / pktCount) : 0;
-            Serial.print(F("[TX] t="));    Serial.print(elapsed);
-            Serial.print(F("s  pkts="));   Serial.print(pktCount);
-            Serial.print(F("  speed="));   Serial.print(speed);
-            Serial.print(F(" B/s  retx=")); Serial.print(retx);
-            Serial.print(F(" ("));  Serial.print(retxPct);  Serial.print(F("%)"));
-            Serial.print(F("  drop="));    Serial.println(txDropped - dropStart);
-            lastStats = now;
-        }
-    }
-
-    {
-        unsigned long elapsed = millis() - testStart;
-        uint32_t speed  = elapsed ? (totalBytes * 1000UL / elapsed) : 0;
-        uint32_t retx   = swRetxCount - retxStart;
-        uint32_t retxPct = pktCount ? (retx * 100UL / pktCount) : 0;
-        Serial.print(F("\r\n[TX DONE] pkts=")); Serial.print(pktCount);
-        Serial.print(F("  bytes="));  Serial.print(totalBytes);
-        Serial.print(F("  speed="));  Serial.print(speed);
-        Serial.print(F(" B/s  retx=")); Serial.print(retx);
-        Serial.print(F(" ("));  Serial.print(retxPct);  Serial.print(F("%)"));
-        Serial.print(F("  drop="));    Serial.println(txDropped - dropStart);
-    }
-    pendingPktReady = false;
-    clearBuffers();
-    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
-    kaLastPingMs  = millis();
-    kaMissed      = 0;
-    kaWaitingPong = false;
-    state = S_CONNECTED;
-    sendOK();
 }
 
 void speedTestRX() {
-    if (state != S_CONNECTED) {
-        Serial.print(F("\r\nERROR: must be in CLI mode (use +++ first)\r\n"));
+    if (state != S_CONNECTED && state != S_DATA) {
+        Serial.print(F("\r\nERROR: must be connected (use ATD then +++ first)\r\n"));
         return;
     }
+    if (state == S_CONNECTED) state = S_DATA;
+    testRxActive    = true;
+    testTxActive    = false;
+    testRxBytes     = 0;
+    testRxPkts      = 0;
+    testRxDropBase  = rxDropped;
+    testIBytes      = 0;
+    testIPkts       = 0;
+    testStart       = millis();
+    testLastStats   = testStart;
     Serial.print(F("\r\nATTEST-RX: receiving — any key to stop\r\n"));
-
-    uint32_t totalBytes = 0;
-    uint32_t pktCount   = 0;
-    uint32_t dropStart  = rxDropped;
-    unsigned long testStart = millis();
-    unsigned long lastStats = testStart;
-
-    state = S_DATA;
-
-    while (true) {
-        if (Serial.available()) { Serial.read(); break; }
-
-        // Let the normal radio receive path run
-        if (pendingPktReady) {
-            pendingPktReady = false;
-            handleRadioPacket(pendingPkt);
-        }
-        if (radio.available()) {
-            uint8_t pkt[PAYLOAD_SIZE];
-            radio.read(pkt, PAYLOAD_SIZE);
-            handleRadioPacket(pkt);
-        }
-
-        // Drain rxBuf — count bytes, discard (don't print to serial)
-        while (rxAvail() > 0) {
-            rxPop();
-            totalBytes++;
-        }
-        if (totalBytes > 0 && pktCount == 0) pktCount = 1;  // armed on first byte
-
-        unsigned long now = millis();
-        if (now - lastStats >= TEST_STATS_MS) {
-            // Snapshot packet count from totalBytes / MAX_DATA
-            pktCount = totalBytes / MAX_DATA;
-            unsigned long elapsed = (now - testStart) / 1000UL;
-            uint32_t speed = elapsed ? (totalBytes / elapsed) : totalBytes;
-            Serial.print(F("[RX] t="));    Serial.print(elapsed);
-            Serial.print(F("s  pkts="));   Serial.print(pktCount);
-            Serial.print(F("  speed="));   Serial.print(speed);
-            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - dropStart);
-            lastStats = now;
-        }
-    }
-
-    {
-        unsigned long elapsed = millis() - testStart;
-        uint32_t speed = elapsed ? (totalBytes * 1000UL / elapsed) : 0;
-        pktCount = totalBytes / MAX_DATA;
-        Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(pktCount);
-        Serial.print(F("  bytes="));  Serial.print(totalBytes);
-        Serial.print(F("  speed="));  Serial.print(speed);
-        Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - dropStart);
-    }
-    pendingPktReady = false;
-    clearBuffers();
-    kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
-    kaLastPingMs  = millis();
-    kaMissed      = 0;
-    kaWaitingPong = false;
-    state = S_CONNECTED;
-    sendOK();
 }
 
 void speedTestEcho() {
@@ -1613,7 +1540,11 @@ void processCommand(const char *cmd) {
     if (strcmp(uc, "ATO") == 0 || strcmp(uc, "ATO0") == 0) {
         if (state == S_CONNECTED) {
             state = S_DATA;
-            sendConnect();   // Hayes standard: ATO confirms with CONNECT
+            // Refresh KA watchdog — remote may not have sent pings while
+            // we were in CLI mode, so give a full fresh window from now.
+            if (!kaInitiator)
+                kaLastPingMs = millis() + (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
+            sendConnect();
         } else if (state == S_DATA) {
             sendConnect();   // already in data mode
         } else {
@@ -2146,8 +2077,73 @@ void loop() {
         }
     }
 
-    // ── 2. Read from serial ──────────────────────────────────────────────────
-    while (Serial.available()) {
+    // ── 2. Read from serial (or feed test pattern if TX test active) ─────────
+    if (testTxActive && (state == S_DATA)) {
+        // Keypress stops the TX test
+        if (Serial.available()) {
+            Serial.read();
+            unsigned long elapsed = millis() - testStart;
+            uint32_t speed = elapsed ? (testTxBytes * 1000UL / elapsed) : 0;
+            uint32_t retx  = swRetxCount - testTxRetxBase;
+            uint32_t retxPct = testTxPkts ? (retx * 100UL / testTxPkts) : 0;
+            Serial.print(F("\r\n[TX DONE] pkts=")); Serial.print(testTxPkts);
+            Serial.print(F("  bytes="));  Serial.print(testTxBytes);
+            Serial.print(F("  speed="));  Serial.print(speed);
+            Serial.print(F(" B/s  retx=")); Serial.print(retx);
+            Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
+            Serial.print(F("  drop="));  Serial.println(txDropped - testTxDropBase);
+            testTxActive = false;
+            state = S_CONNECTED;
+            kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+            kaLastPingMs  = millis() + (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
+            kaMissed      = 0;
+            kaWaitingPong = false;
+            sendOK();
+        } else {
+            if (flowMode == 0) {
+                // Transparent mode: fill transBuf directly and flush immediately
+                if (transBufLen == 0) {
+                    buildTestPacket(transBuf, testPktCounter);
+                    transBufLen     = PAYLOAD_SIZE;   // mark as full — flush now
+                    transLastByteMs = millis();
+                    testTxBytes    += PAYLOAD_SIZE;
+                    testTxPkts++;
+                    testIBytes     += PAYLOAD_SIZE;
+                    testIPkts++;
+                    testPktCounter++;
+                }
+            } else {
+                // SWFLOW/HWACK: fill txBuf up to half capacity
+                while (txAvail() < (TX_BUF_SIZE / 2)) {
+                    uint8_t payload[MAX_DATA];
+                    buildTestPacket(payload, testPktCounter);
+                    for (uint8_t i = 0; i < MAX_DATA; i++) txPush(payload[i]);
+                    testTxBytes += MAX_DATA;
+                    testTxPkts++;
+                    testIBytes  += MAX_DATA;
+                    testIPkts++;
+                    testPktCounter++;
+                }
+            }
+            // Periodic stats
+            unsigned long tnow = millis();
+            if (tnow - testLastStats >= TEST_STATS_MS) {
+                unsigned long elapsed = (tnow - testStart) / 1000UL;
+                uint32_t iRetx   = swRetxCount - testIRetxBase;
+                uint32_t retxPct = testIPkts ? (iRetx * 100UL / testIPkts) : 0;
+                Serial.print(F("[TX] t="));    Serial.print(elapsed);
+                Serial.print(F("s  pkts="));   Serial.print(testTxPkts);
+                Serial.print(F("  speed="));   Serial.print(testIBytes);
+                Serial.print(F(" B/s  retx=")); Serial.print(iRetx);
+                Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
+                Serial.print(F("  drop="));    Serial.println(txDropped - testTxDropBase);
+                testIBytes    = 0;
+                testIPkts     = 0;
+                testIRetxBase = swRetxCount;
+                testLastStats = tnow;
+            }
+        }
+    } else while (Serial.available()) {
         uint8_t b = (uint8_t)Serial.read();
         lastSerialMs = millis();
 
@@ -2282,11 +2278,53 @@ void loop() {
         }
     }
 
-    // ── 6. Drain RX buffer → serial ─────────────────────────────────────────
-    while (rxAvail() > 0) {
-        int b = rxPop();
-        if (b < 0) break;
-        Serial.write((uint8_t)b);
+    // ── 6. Drain RX buffer → serial (or count+discard if RX test active) ─────
+    if (testRxActive) {
+        // Keypress stops RX test
+        if (Serial.available()) {
+            Serial.read();
+            // Drain any remaining bytes from rxBuf before printing final stats
+            while (rxAvail() > 0) { rxPop(); testRxBytes++; }
+            unsigned long elapsed = millis() - testStart;
+            uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
+            testRxPkts = testRxBytes / MAX_DATA;
+            Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
+            Serial.print(F("  bytes="));  Serial.print(testRxBytes);
+            Serial.print(F("  speed="));  Serial.print(speed);
+            Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
+            testRxActive = false;
+            state = S_CONNECTED;
+            kaPingAt      = millis() + (unsigned long)regS11 * 1000UL;
+            kaLastPingMs  = millis() + (unsigned long)regS11 * (unsigned long)regS12 * 1000UL;
+            kaMissed      = 0;
+            kaWaitingPong = false;
+            sendOK();
+        } else {
+            // Count and discard — do not print to serial
+            while (rxAvail() > 0) {
+                rxPop();
+                testRxBytes++;
+                testIBytes++;
+            }
+            // Periodic stats
+            unsigned long tnow = millis();
+            if (tnow - testLastStats >= TEST_STATS_MS) {
+                unsigned long elapsed = (tnow - testStart) / 1000UL;
+                testRxPkts = testRxBytes / MAX_DATA;
+                Serial.print(F("[RX] t="));    Serial.print(elapsed);
+                Serial.print(F("s  pkts="));   Serial.print(testRxPkts);
+                Serial.print(F("  speed="));   Serial.print(testIBytes);
+                Serial.print(F(" B/s  drop=")); Serial.println(rxDropped - testRxDropBase);
+                testIBytes    = 0;
+                testLastStats = tnow;
+            }
+        }
+    } else {
+        while (rxAvail() > 0) {
+            int b = rxPop();
+            if (b < 0) break;
+            Serial.write((uint8_t)b);
+        }
     }
 
     // ── 7. Flush TX buffer → radio ───────────────────────────────────────────
