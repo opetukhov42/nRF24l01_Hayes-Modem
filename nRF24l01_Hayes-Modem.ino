@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.102.0"
+#define MODEM_VERSION "v1.103.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -2181,11 +2181,9 @@ void printKaStats() {
         Serial.print(F("  KA[Sndr]:"));
         bool sentRecently = kaLastSentMs && (now - kaLastSentMs) < TEST_STATS_MS;
         bool pongRecently = kaLastPongMs && (now - kaLastPongMs) < TEST_STATS_MS;
-        if (kaMissed >= regS12) {
-            // about to drop (sendNoCarrier fires asynchronously)
-            Serial.print(F("miss ")); Serial.print(kaMissed);
-            Serial.print(F("/")); Serial.println(regS12);
-        } else if (kaMissed > 0) {
+        if (kaMissed > 0) {
+            // Show ping activity even while missing — ping still fires on schedule
+            if (sentRecently) Serial.print(F("ping/"));
             Serial.print(F("miss ")); Serial.print(kaMissed);
             Serial.print(F("/")); Serial.println(regS12);
         } else if (pongRecently) {
