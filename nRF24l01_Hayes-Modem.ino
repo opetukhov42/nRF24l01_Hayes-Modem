@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.97.0"
+#define MODEM_VERSION "v1.98.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -2452,6 +2452,9 @@ void loop() {
     // Drain pending packet from flushTxBuffer RX wait (avoids re-entrancy).
     if (pendingPktReady) {
         pendingPktReady = false;
+        if (testRxActive   && pendingPkt[0] == PKT_DATA) testRxPkts++;
+        if (testEchoActive && pendingPkt[0] == PKT_DATA) { testEchoCount++; testEchoICount++; }
+        if (testTxRxActive && pendingPkt[0] == PKT_DATA) testTxRxRxPkts++;
         if (flowMode == 0 && (state == S_DATA || state == S_CONNECTED)) {
             ledFlashRD();
             for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
