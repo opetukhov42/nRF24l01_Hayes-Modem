@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.114.0"
+#define MODEM_VERSION "v1.116.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -746,9 +746,14 @@ void flushTxBuffer() {
                     uint8_t tmp[PAYLOAD_SIZE];
                     radio.read(tmp, PAYLOAD_SIZE);
                     uint8_t pt = tmp[0];
-                    if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
+                    if ((pt == PKT_SWACK || pt == PKT_SWACK_YIELD)
+                        && tmp[DATA_OFFSET] == ctrlPkt[1]) {
+                        // SWACK is specifically for our ctrl packet
                         handleRadioPacket(tmp);
                         gotAck2 = true;
+                    } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
+                        // Stale SWACK for a different packet — process but don't confirm
+                        handleRadioPacket(tmp);
                     } else if (!pendingPktReady) {
                         memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                         pendingPktReady = true;
@@ -773,12 +778,16 @@ void flushTxBuffer() {
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
-                if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
+                // Handle all packets immediately — SWACK/YIELD advances our
+                // stop-and-wait; transport packets (PING/PONG/DATA/XON/XOFF)
+                // get ACKed via swflowAckData inside handleRadioPacket.
+                // No re-entrancy risk: handleRadioPacket never calls flushTxBuffer.
+                if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD ||
+                    pt == PKT_DATA  || pt == PKT_PING || pt == PKT_PONG ||
+                    pt == PKT_XON   || pt == PKT_XOFF) {
                     handleRadioPacket(tmp);
                     gotPkt = true;
                 } else if (!pendingPktReady) {
-                    // Transport packets (PING/PONG/XON/XOFF/DATA) deferred
-                    // to pendingPkt — avoids re-entrant swflowAckData call.
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
                     gotPkt = true;
@@ -825,9 +834,17 @@ void flushTxBuffer() {
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
-                if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
+                if ((pt == PKT_SWACK || pt == PKT_SWACK_YIELD)
+                    && tmp[DATA_OFFSET] == swLastPkt[1]) {
+                    // SWACK is for our data packet
                     handleRadioPacket(tmp);
                     gotAck = true;
+                } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
+                    // Stale SWACK — process but don't confirm
+                    handleRadioPacket(tmp);
+                } else if (pt == PKT_DATA  || pt == PKT_PING || pt == PKT_PONG ||
+                           pt == PKT_XON   || pt == PKT_XOFF) {
+                    handleRadioPacket(tmp);
                 } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
