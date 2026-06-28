@@ -117,7 +117,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.76.0"
+#define MODEM_VERSION "v1.77.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -1460,7 +1460,7 @@ void autoSelectChannel() {
     Serial.print(bestHits);
     Serial.print(F("/"));
     Serial.print(regS17);
-    Serial.println(F(" hits — saved)"));
+    Serial.print(F(" hits — saved)\r\n"));
     sendOK();
 }
 
@@ -1601,9 +1601,9 @@ void processCommand(const char *cmd) {
         if (startupSlot < DIAL_SLOTS && dialStr[startupSlot][0] != '\0') {
             Serial.print(startupSlot);
             Serial.print(F(" -> "));
-            Serial.println(dialStr[startupSlot]);
+            Serial.print(dialStr[startupSlot]); Serial.print(F("\r\n"));
         } else {
-            Serial.println(F("none"));
+            Serial.print(F("none\r\n"));
         }
         for (uint8_t s = 0; s < DIAL_SLOTS; s++) {
             Serial.print(F("&Z"));
@@ -2157,7 +2157,7 @@ void loop() {
             char fakeCmd[DIAL_STR_LEN + 5];
             snprintf(fakeCmd, sizeof(fakeCmd), "ATD %s", dialStr[startupSlot]);
             cliPrint(F("Autodialling: "));
-            if (inCliMode()) Serial.println(dialStr[startupSlot]);
+            cliPrintln(dialStr[startupSlot]);
             processCommand(fakeCmd);
         }
     }
@@ -2170,7 +2170,7 @@ void loop() {
         while (rxAvail() > 0) { rxPop(); testRxBytes++; }
         unsigned long elapsed = millis() - testStart;
         uint32_t speed = elapsed ? (testRxBytes * 1000UL / elapsed) : 0;
-        testRxPkts = testRxBytes / MAX_DATA;
+        // testRxPkts counted directly at radio receive
         Serial.print(F("\r\n[RX DONE] pkts=")); Serial.print(testRxPkts);
         Serial.print(F("  bytes="));  Serial.print(testRxBytes);
         Serial.print(F("  speed="));  Serial.print(speed);
@@ -2297,7 +2297,7 @@ void loop() {
         plusCount = 0;
         escapeArmed = false;
         kaResetWindow();
-        Serial.println();
+        Serial.print(F("\r\n"));
         sendOK();
     }
 
@@ -2353,7 +2353,7 @@ void loop() {
             ledFlashRD();
             for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
                 if (regS13 == 1 && (pendingPkt[i] == 0x11 || pendingPkt[i] == 0x13)) continue;
-                if (!rxPush(pendingPkt[i])) { rxDropped++; ledFlashER(); }
+                rxPush(pendingPkt[i]);   // rxPush() counts drops internally
             }
             checkFlowControl();
         } else {
@@ -2368,7 +2368,7 @@ void loop() {
             ledFlashRD();
             for (uint8_t i = 0; i < PAYLOAD_SIZE; i++) {
                 if (regS13 == 1 && (pkt[i] == 0x11 || pkt[i] == 0x13)) continue;
-                if (!rxPush(pkt[i])) { rxDropped++; ledFlashER(); }
+                rxPush(pkt[i]);   // rxPush() counts drops internally
             }
             checkFlowControl();
         } else {
