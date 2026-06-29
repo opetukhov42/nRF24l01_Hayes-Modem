@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.123.0"
+#define MODEM_VERSION "v1.128.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -241,6 +241,8 @@ uint32_t rxDropped   = 0;    // bytes dropped: radio→serial direction (radio c
 unsigned long kaLastConfirmedMs = 0; // millis() of last received packet
 unsigned long kaPingAt          = 0; // millis() when next probe is due
 unsigned long kaLastPingSentMs  = 0; // millis() when last PKT_PING was queued
+unsigned long kaLastPingRcvdMs  = 0; // millis() when last PKT_PING was received
+bool          kaWaitingSwack    = false; // true after ping queued, until SWACK received
 uint8_t       kaMissed          = 0; // consecutive unconfirmed pings
 uint8_t       ctrlPkt[PAYLOAD_SIZE];  // priority control packet (ping/pong/xon/xoff)
 bool          ctrlPktReady   = false; // true = send ctrlPkt before next data
@@ -917,10 +919,6 @@ void handleRadioPacket(const uint8_t *pkt) {
     // uint8_t seq = pkt[1];   // could be used for duplicate detection
     uint8_t len  = pkt[2];
 
-    // Any received packet proves link alive.
-    if ((state == S_DATA || state == S_CONNECTED) && regS10)
-        kaLastConfirmedMs = millis();
-
     switch (type) {
         case PKT_DATA:
             if (state == S_DATA) {
@@ -973,6 +971,8 @@ void handleRadioPacket(const uint8_t *pkt) {
                 kaMissed          = 0;
                 kaPingAt          = 0;
                 kaLastPingSentMs  = 0;
+                kaLastPingRcvdMs  = 0;
+                kaWaitingSwack    = false;
                 kaLastConfirmedMs = 0;
                 yieldToRemote  = false;
                 ctrlPktReady   = false;
@@ -1022,8 +1022,10 @@ void handleRadioPacket(const uint8_t *pkt) {
             break;
 
         case PKT_PING:
-            if (state == S_DATA || state == S_CONNECTED)
+            if (state == S_DATA || state == S_CONNECTED) {
+                kaLastPingRcvdMs = millis();
                 swflowAckData(pkt[1]);  // SWACK proves delivery to sender
+            }
             break;
 
 
@@ -1069,8 +1071,16 @@ void handleRadioPacket(const uint8_t *pkt) {
             yieldToRemote = true;
             // fall through
         case PKT_SWACK:
-            // Stop-and-wait: SWACK means our last packet was delivered.
-            // swLastPkt is now stale — clear it.
+            // SWACK proves remote received our last packet — link confirmed.
+            if ((state == S_DATA || state == S_CONNECTED) && regS10) {
+                kaLastConfirmedMs = millis();
+                if (kaWaitingSwack) {
+                    // Ping was confirmed — clear miss counter, reset full window
+                    kaWaitingSwack = false;
+                    kaMissed       = 0;
+                    kaPingAt       = millis() + (unsigned long)regS11 * 1000UL;
+                }
+            }
             swLastPktValid = false;
             break;
     }
@@ -1710,6 +1720,8 @@ void processCommand(const char *cmd) {
         kaMissed          = 0;
         kaPingAt          = 0;
         kaLastPingSentMs  = 0;
+        kaLastPingRcvdMs  = 0;
+        kaWaitingSwack    = false;
         kaLastConfirmedMs = 0;
         yieldToRemote  = false;
         ctrlPktReady   = false;
@@ -2218,18 +2230,23 @@ void printKaStats() {
     unsigned long ageSec   = kaLastConfirmedMs ? (now - kaLastConfirmedMs) / 1000UL : 9999UL;
     unsigned long winSec   = (unsigned long)regS11 * (unsigned long)regS12;
     bool          pingSent = kaLastPingSentMs && (now - kaLastPingSentMs) < TEST_STATS_MS;
+    bool          pingRcvd = kaLastPingRcvdMs && (now - kaLastPingRcvdMs) < TEST_STATS_MS;
     Serial.print(F("  KA:"));
     if (kaMissed > 0) {
         if (pingSent) Serial.print(F("ping/"));
         Serial.print(F("miss ")); Serial.print(kaMissed);
         Serial.print(F("/"));    Serial.println(regS12);
+    } else if (pingSent && pingRcvd) {
+        Serial.println(F("ping-rcvd+sent"));
     } else if (pingSent) {
         Serial.println(F("ping-sent"));
-    } else if (ageSec == 0) {
-        Serial.println(F("ok"));
+    } else if (pingRcvd) {
+        Serial.println(F("ping-rcvd"));
     } else if (ageSec < winSec) {
-        Serial.print(ageSec); Serial.print(F("s/"));
-        Serial.print(winSec); Serial.println(F("s"));
+        // Show age so operator can see how fresh the last confirmation was
+        Serial.print(F("ok("));
+        Serial.print(ageSec);
+        Serial.println(F("s)"));
     } else {
         Serial.println(F("timeout?"));
     }
@@ -2637,14 +2654,12 @@ void loop() {
         if (kaPingAt == 0)
             kaPingAt = now + (unsigned long)regS11 * 1000UL;
         if (now >= kaPingAt) {
-            unsigned long silenceMs = kaLastConfirmedMs ? now - kaLastConfirmedMs : now;
-            if (silenceMs < (unsigned long)regS11 * 1000UL) {
-                // Recent activity confirmed — link alive, reset window
-                kaMissed = 0;
-                kaPingAt = now + (unsigned long)regS11 * 1000UL;
-            } else {
-                // Silence for a full S11 window — probe or count miss
+            unsigned long kaNow     = millis();
+            unsigned long silenceMs = kaLastConfirmedMs ? kaNow - kaLastConfirmedMs : kaNow;
+            if (kaWaitingSwack) {
+                // Ping was sent last window — no SWACK yet, count as miss
                 kaMissed++;
+                kaWaitingSwack = false;
                 cliPrint(F("KA miss ")); cliPrint(kaMissed);
                 cliPrint('/'); cliPrintln(regS12);
                 ledFlashER();
@@ -2653,15 +2668,29 @@ void loop() {
                     clearBuffers();
                     kaMissed = 0; kaPingAt = 0;
                     kaLastPingSentMs  = 0;
+                    kaLastPingRcvdMs  = 0;
+                    kaWaitingSwack    = false;
                     kaLastConfirmedMs = 0;
                     state = S_IDLE;
                     openListenPipes();
                     sendNoCarrier();
                 } else {
+                    // Send another ping for the next window
                     queueCtrl(PKT_PING);
                     kaLastPingSentMs = millis();
-                    kaPingAt = now + (unsigned long)regS11 * 1000UL;
+                    kaWaitingSwack   = true;
+                    kaPingAt = kaNow + (unsigned long)regS11 * 1000UL;
                 }
+            } else if (silenceMs >= (unsigned long)regS11 * 1000UL) {
+                // Silent for a full window — send probe
+                queueCtrl(PKT_PING);
+                kaLastPingSentMs = millis();
+                kaWaitingSwack   = true;
+                kaPingAt = kaNow + (unsigned long)regS11 * 1000UL;
+            } else {
+                // Recent SWACK confirmed — link alive, reset window
+                kaMissed = 0;
+                kaPingAt = kaNow + (unsigned long)regS11 * 1000UL;
             }
         }
     }
