@@ -118,7 +118,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.128.0"
+#define MODEM_VERSION "v1.130.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -757,15 +757,18 @@ void flushTxBuffer() {
                         if (pt == PKT_SWACK_YIELD) gotYield2 = true;
                     } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
                         handleRadioPacket(tmp);
-                    } else if (pt == PKT_DATA || pt == PKT_PING || pt == PKT_PONG ||
+                    } else if (pt == PKT_PING || pt == PKT_PONG ||
                                pt == PKT_XON  || pt == PKT_XOFF) {
+                        // Handle ctrl packets inline — they don't switch radio mode
+                        handleRadioPacket(tmp);
+                    } else if (!pendingPktReady) {
+                        // Defer PKT_DATA to pendingPkt — avoids radio mode switch
+                        // (openWritePipe for SWACK) during our SWACK receive window.
                         if (pt == PKT_DATA) {
                             if (testRxActive)   testRxPkts++;
                             if (testEchoActive) { testEchoCount++; testEchoICount++; }
                             if (testTxRxActive) testTxRxRxPkts++;
                         }
-                        handleRadioPacket(tmp);
-                    } else if (!pendingPktReady) {
                         memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                         pendingPktReady = true;
                     }
@@ -2230,7 +2233,7 @@ void printKaStats() {
     unsigned long ageSec   = kaLastConfirmedMs ? (now - kaLastConfirmedMs) / 1000UL : 9999UL;
     unsigned long winSec   = (unsigned long)regS11 * (unsigned long)regS12;
     bool          pingSent = kaLastPingSentMs && (now - kaLastPingSentMs) < TEST_STATS_MS;
-    bool          pingRcvd = kaLastPingRcvdMs && (now - kaLastPingRcvdMs) < TEST_STATS_MS;
+    bool          pingRcvd = kaLastPingRcvdMs && (now - kaLastPingRcvdMs) < (TEST_STATS_MS * 2UL);
     Serial.print(F("  KA:"));
     if (kaMissed > 0) {
         if (pingSent) Serial.print(F("ping/"));
@@ -2242,8 +2245,12 @@ void printKaStats() {
         Serial.println(F("ping-sent"));
     } else if (pingRcvd) {
         Serial.println(F("ping-rcvd"));
+    } else if (kaWaitingSwack) {
+        // Ping sent, SWACK not yet received — show wait state
+        Serial.print(F("ping-wait("));
+        Serial.print(ageSec);
+        Serial.println(F("s)"));
     } else if (ageSec < winSec) {
-        // Show age so operator can see how fresh the last confirmation was
         Serial.print(F("ok("));
         Serial.print(ageSec);
         Serial.println(F("s)"));
