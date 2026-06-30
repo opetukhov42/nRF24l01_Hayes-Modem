@@ -95,20 +95,38 @@
  *   With S13=0: 0x11/0x13 bytes pass through as data; no flow signals sent.
  *
  * Packet format (32 bytes max nRF24 payload):
- *   [0]  type   – PKT_DATA=0x01, PKT_XON=0x02, PKT_XOFF=0x03,
- *                 PKT_DISC=0x04, PKT_CONN=0x05, PKT_ACK=0x06,
- *                 PKT_NACK=0x07 (reserved, unused),
- *                 PKT_SWACK=0x08 (SWFLOW cumulative ACK),
- *                 PKT_PING=0x09 (keep-alive probe — SWACK is the reply),
- *                 PKT_PONG=0x0A (deprecated — reserved for compatibility),
- *                 PKT_SWACK_YIELD=0x0B (SWFLOW ACK + yield TX token to remote)
- *                 PKT_DIAG_PING=0x0C  (diagnostic ping, ATPING command)
- *                 PKT_DIAG_PONG=0x0D  (diagnostic pong, reply to ATPING)
- *                 PKT_TEST_START=0x0E (speed test start / re-arm)
- *                 PKT_TEST_STOP=0x0F  (speed test stop from either side)
+ *   [0]  type   – top-level packet type, one of:
+ *                 PKT_DATA=0x01        user data (SWFLOW stop-and-wait)
+ *                 PKT_DISC=0x04        disconnect (sent directly, not SWFLOW)
+ *                 PKT_CONN=0x05        connection request (sent directly)
+ *                 PKT_ACK=0x06         connection accepted (sent directly)
+ *                 PKT_NACK=0x07        reserved, unused
+ *                 PKT_SWACK=0x08       SWFLOW cumulative ACK
+ *                 PKT_PING=0x09        standalone keep-alive probe — only
+ *                                      sent during genuine silence (no SWACK
+ *                                      sent recently to piggyback on); reply
+ *                                      is a normal SWACK via swflowAckData()
+ *                 PKT_SWACK_YIELD=0x0B SWFLOW ACK + yield TX token to remote
+ *                 PKT_DIAG_PING=0x0C   diagnostic ping (ATPING command)
+ *                 PKT_DIAG_PONG=0x0D   diagnostic pong (reply to ATPING)
+ *                 PKT_TEST_START=0x0E  speed test start / re-arm (unused)
+ *                 PKT_TEST_STOP=0x0F   speed test stop (unused)
  *   [1]  seq    – rolling 0-255 sequence number
- *   [2]  length – number of payload bytes that follow (0-29)
- *   [3..31] payload
+ *   [2]  length – number of payload bytes that follow (0-29, PKT_DATA only)
+ *   [3..31] payload – PKT_DATA only: up to 29 bytes of user data (DATA_OFFSET=3)
+ *
+ *   For PKT_SWACK / PKT_SWACK_YIELD specifically, bytes [3..4] are reused:
+ *   [3]  ack'd seq – the seq of the packet being acknowledged
+ *   [4]  piggyback – a ctrl packet type riding along with this ACK (0=none):
+ *                    PKT_PING=0x09  remote is probing us — we'll queue a
+ *                                   PKT_PONG reply, piggybacked on our own
+ *                                   next SWACK in turn
+ *                    PKT_PONG=0x0A  reply to our own probe — arrival alone
+ *                                   is sufficient, no further action
+ *                    PKT_XON=0x02   remote resumes accepting data
+ *                    PKT_XOFF=0x03  remote wants us to pause sending
+ *                    PKT_XON/PKT_XOFF/PKT_PONG are NEVER sent as a top-level
+ *                    [0] type — they only ever appear here, piggybacked in [4].
  */
 
 #include <SPI.h>
@@ -118,7 +136,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.130.0"
+#define MODEM_VERSION "v1.143.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -166,6 +184,7 @@
 #define PAYLOAD_SIZE  32
 #define DATA_OFFSET    3
 #define MAX_DATA      (PAYLOAD_SIZE - DATA_OFFSET)   // 29
+#define PIGGY_OFFSET   4   // byte 4 of a SWACK: piggybacked ctrl pkt type (0=none)
 
 // ── EEPROM layout (each field 3 bytes) ───────────────────────────────────────
 #define EE_OWN_MAC    0    // bytes 0-2  own MAC
@@ -244,8 +263,9 @@ unsigned long kaLastPingSentMs  = 0; // millis() when last PKT_PING was queued
 unsigned long kaLastPingRcvdMs  = 0; // millis() when last PKT_PING was received
 bool          kaWaitingSwack    = false; // true after ping queued, until SWACK received
 uint8_t       kaMissed          = 0; // consecutive unconfirmed pings
-uint8_t       ctrlPkt[PAYLOAD_SIZE];  // priority control packet (ping/pong/xon/xoff)
+uint8_t       ctrlPktType = 0;        // queued ctrl type for piggyback (0=none)
 bool          ctrlPktReady   = false; // true = send ctrlPkt before next data
+unsigned long lastSwackSentMs = 0;    // millis() of last SWACK we sent (any reason)
 
 // Dial retry state (managed by the connect-timeout block in loop())
 uint32_t dialRetryCount  = 0;          // retries fired so far (uint32 for forever mode)
@@ -677,14 +697,15 @@ bool sendPacket(uint8_t type, const uint8_t *data, uint8_t len) {
     return ok;
 }
 
-// Queue a control packet for reliable SWFLOW delivery.
-// Priority over data — drained first by flushTxBuffer.
-// One slot: latest wins (ping/pong/xon/xoff mutually exclusive).
+// Queue a control packet (ping/pong/xon/xoff) for delivery.
+// Normally piggybacked: swflowAckData() attaches it to the next SWACK we
+// send in response to incoming data, guaranteeing the remote's radio is
+// listening at that exact moment. PKT_PING is the one exception — if no
+// SWACK has been sent recently (genuine silence, nothing to piggyback on),
+// flushTxBuffer() sends it standalone instead to provoke a reply.
+// One slot: latest wins.
 void queueCtrl(uint8_t type) {
-    memset(ctrlPkt, 0, PAYLOAD_SIZE);
-    ctrlPkt[0] = type;
-    ctrlPkt[1] = txSeq++;
-    ctrlPkt[2] = 0;
+    ctrlPktType  = type;
     ctrlPktReady = true;
 }
 
@@ -732,60 +753,23 @@ static void buildTestPacket(uint8_t *buf, uint32_t counter) {
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
 
-    // Priority: send queued control packet before data (ping/pong/xon/xoff).
-    // Uses same stop-and-wait loop as data — guaranteed delivery.
-    if (ctrlPktReady) {
+    // Ping delivery, idle case only: send standalone ONLY when we haven't
+    // sent a SWACK recently — meaning no incoming data is arriving for us
+    // to piggyback on. If data IS flowing in (e.g. ATTEST-RX), swflowAckData
+    // will piggyback this ping on its next reply, which is always safer
+    // (remote's radio is guaranteed listening right after it transmitted).
+    // PONG/XON/XOFF never reach here — always queued in response to
+    // received data, where piggyback always applies. Only PING can be
+    // queued during genuine silence with nothing to piggyback on.
+    bool noRecentSwack = (millis() - lastSwackSentMs) > (unsigned long)SW_ACK_WAIT_MS * 4UL;
+    if (ctrlPktReady && ctrlPktType == PKT_PING && noRecentSwack) {
         ctrlPktReady = false;
-        bool gotAck2 = false;
-        bool gotYield2 = false;
-        for (uint8_t attempt = 0; attempt <= SW_RETX_MAX; attempt++) {
-            if (attempt > 0) swRetxCount++;
-            openWritePipe(remoteMac);
-            radio.write(ctrlPkt, PAYLOAD_SIZE);
-            ledFlashSD();
-            openListenPipes();
-            unsigned long waitEnd2 = millis() + SW_ACK_WAIT_MS;
-            while (millis() < waitEnd2) {
-                while (radio.available()) {
-                    uint8_t tmp[PAYLOAD_SIZE];
-                    radio.read(tmp, PAYLOAD_SIZE);
-                    uint8_t pt = tmp[0];
-                    if ((pt == PKT_SWACK || pt == PKT_SWACK_YIELD)
-                        && tmp[DATA_OFFSET] == ctrlPkt[1]) {
-                        handleRadioPacket(tmp);
-                        gotAck2 = true;
-                        if (pt == PKT_SWACK_YIELD) gotYield2 = true;
-                    } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
-                        handleRadioPacket(tmp);
-                    } else if (pt == PKT_PING || pt == PKT_PONG ||
-                               pt == PKT_XON  || pt == PKT_XOFF) {
-                        // Handle ctrl packets inline — they don't switch radio mode
-                        handleRadioPacket(tmp);
-                    } else if (!pendingPktReady) {
-                        // Defer PKT_DATA to pendingPkt — avoids radio mode switch
-                        // (openWritePipe for SWACK) during our SWACK receive window.
-                        if (pt == PKT_DATA) {
-                            if (testRxActive)   testRxPkts++;
-                            if (testEchoActive) { testEchoCount++; testEchoICount++; }
-                            if (testTxRxActive) testTxRxRxPkts++;
-                        }
-                        memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
-                        pendingPktReady = true;
-                    }
-                }
-                if (gotAck2) break;
-            }
-            if (gotAck2) break;
-        }
-        // Remote sent SWACK_YIELD — it has a ctrl packet to send (e.g. pong).
-        // Enter yield wait so it can deliver into our RX window.
-        if (gotYield2) {
-            yieldToRemote = true;   // handled by normal yield path below
-        }
+        sendDirectCtrl(PKT_PING);
+        kaLastPingSentMs = millis();
         return;
     }
 
-    if (radioXoffRecv) return;   // XOFF: ctrlPkt already sent above
+    if (radioXoffRecv) return;   // XOFF blocks data transmission
 
     if (yieldToRemote) {
         yieldToRemote = false;
@@ -797,13 +781,14 @@ void flushTxBuffer() {
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
-                // Handle all packets immediately — SWACK/YIELD advances our
-                // stop-and-wait; transport packets (PING/PONG/DATA/XON/XOFF)
-                // get ACKed via swflowAckData inside handleRadioPacket.
+                // Handle all packets immediately. PKT_PING triggers an
+                // immediate SWACK reply (handleRadioPacket → swflowAckData).
+                // PKT_PONG/XON/XOFF only ever travel piggybacked inside a
+                // SWACK payload now, never as a top-level type — no case
+                // needed for them here.
                 // No re-entrancy risk: handleRadioPacket never calls flushTxBuffer.
                 if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD ||
-                    pt == PKT_DATA  || pt == PKT_PING || pt == PKT_PONG ||
-                    pt == PKT_XON   || pt == PKT_XOFF) {
+                    pt == PKT_DATA  || pt == PKT_PING) {
                     if (pt == PKT_DATA) {
                         if (testRxActive)   testRxPkts++;
                         if (testEchoActive) { testEchoCount++; testEchoICount++; }
@@ -866,8 +851,7 @@ void flushTxBuffer() {
                 } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
                     // Stale SWACK — process but don't confirm
                     handleRadioPacket(tmp);
-                } else if (pt == PKT_DATA  || pt == PKT_PING || pt == PKT_PONG ||
-                           pt == PKT_XON   || pt == PKT_XOFF) {
+                } else if (pt == PKT_DATA || pt == PKT_PING) {
                     if (pt == PKT_DATA) {
                         if (testRxActive)   testRxPkts++;
                         if (testEchoActive) { testEchoCount++; testEchoICount++; }
@@ -990,16 +974,6 @@ void handleRadioPacket(const uint8_t *pkt) {
             }
             break;
 
-        case PKT_XON:
-            radioXoffRecv = false;
-            swflowAckData(pkt[1]);
-            break;
-
-        case PKT_XOFF:
-            radioXoffRecv = true;
-            swflowAckData(pkt[1]);
-            break;
-
         case PKT_ACK:
             // Handshake ACK — accept during active dial (S_CONNECTING) OR
             // during the inter-retry wait (S_IDLE with dialRetrying=true).
@@ -1023,14 +997,6 @@ void handleRadioPacket(const uint8_t *pkt) {
                 state         = S_DATA;  // switch AFTER printing CONNECT
             }
             break;
-
-        case PKT_PING:
-            if (state == S_DATA || state == S_CONNECTED) {
-                kaLastPingRcvdMs = millis();
-                swflowAckData(pkt[1]);  // SWACK proves delivery to sender
-            }
-            break;
-
 
         case PKT_DIAG_PING:
             // Diagnostic ping received — only reply if we are fully idle.
@@ -1069,11 +1035,22 @@ void handleRadioPacket(const uint8_t *pkt) {
             // Handled inline in atPing() wait loop — nothing to do here.
             break;
 
+        case PKT_PING:
+            // Standalone ping — used only during genuine silence, when
+            // neither side has data to piggyback a ping on. Reply with a
+            // normal SWACK (via swflowAckData) so our reply naturally
+            // carries YIELD/piggyback if we have something queued too.
+            if (state == S_DATA || state == S_CONNECTED) {
+                kaLastPingRcvdMs = millis();
+                swflowAckData(pkt[1]);
+            }
+            break;
+
         case PKT_SWACK_YIELD:
             // Remote ACKs our data AND wants a TX window.
             yieldToRemote = true;
             // fall through
-        case PKT_SWACK:
+        case PKT_SWACK: {
             // SWACK proves remote received our last packet — link confirmed.
             if ((state == S_DATA || state == S_CONNECTED) && regS10) {
                 kaLastConfirmedMs = millis();
@@ -1085,7 +1062,20 @@ void handleRadioPacket(const uint8_t *pkt) {
                 }
             }
             swLastPktValid = false;
+            // Extract any piggybacked ctrl packet (ping/pong/xon/xoff).
+            uint8_t piggyType = pkt[PIGGY_OFFSET];
+            if (piggyType == PKT_PING && (state == S_DATA || state == S_CONNECTED)) {
+                kaLastPingRcvdMs = millis();
+                queueCtrl(PKT_PONG);   // reply piggybacked on our next SWACK
+            } else if (piggyType == PKT_PONG) {
+                // pong has no further action — its arrival alone is enough
+            } else if (piggyType == PKT_XON) {
+                radioXoffRecv = false;
+            } else if (piggyType == PKT_XOFF) {
+                radioXoffRecv = true;
+            }
             break;
+        }
     }
 }
 
@@ -1094,33 +1084,33 @@ void handleRadioPacket(const uint8_t *pkt) {
 // Sends PKT_SWACK_YIELD if we have data queued (cooperative duplex),
 // otherwise plain PKT_SWACK. No gap detection — stop-and-wait guarantees
 // in-order delivery; duplicates detected by seq == last seen.
+// Sends a SWACK for the given seq. If a control packet (ping/pong/xon/xoff)
+// is queued, it is piggybacked directly on this SWACK — never sent as a
+// separate blind transmission. This guarantees the remote's radio is in
+// RX mode (it's actively waiting for our SWACK after sending us a packet)
+// at the exact moment the ctrl packet arrives.
 bool swflowAckData(uint8_t seq) {
     if (flowMode != 2) return true;
+    bool isDup = (rxLastSeq != 0xFF && seq == rxLastSeq);
+    if (!isDup) rxLastSeq = seq;
 
-    // Duplicate detection: if seq matches rxLastSeq (global, reset on connect).
-    if (rxLastSeq != 0xFF && seq == rxLastSeq) {
-        // Re-send SWACK — pong bypasses XOFF.
-        uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
-        bool haveData = ((txAvail() > 0 && !radioXoffRecv) || ctrlPktReady);
-        ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
-        ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
-        openWritePipe(remoteMac); radio.write(ack, PAYLOAD_SIZE);
-        if (haveData) ledFlashSD(); else ledFlashSD();
-        openListenPipes();
-        return false;   // discard duplicate
-    }
-    rxLastSeq = seq;
-
-    // Yield if data queued OR pending pong — pong bypasses XOFF.
     uint8_t ack[PAYLOAD_SIZE]; memset(ack, 0, PAYLOAD_SIZE);
     bool haveData = ((txAvail() > 0 && !radioXoffRecv) || ctrlPktReady);
     ack[0] = haveData ? PKT_SWACK_YIELD : PKT_SWACK;
     ack[1] = txSeq++; ack[2] = 1; ack[DATA_OFFSET] = seq;
+    if (ctrlPktReady) {
+        // Piggyback the queued ctrl type onto this SWACK (ping/pong/xon/xoff
+        // carry no payload — just the single type byte).
+        ack[PIGGY_OFFSET] = ctrlPktType;
+        ctrlPktReady = false;
+        if (ctrlPktType == PKT_PING) kaLastPingSentMs = millis();
+    }
+    lastSwackSentMs = millis();
     openWritePipe(remoteMac);
     bool ok = radio.write(ack, PAYLOAD_SIZE);
     if (ok) ledFlashSD(); else ledFlashER();
     openListenPipes();
-    return true;
+    return !isDup;
 }
 
 
@@ -2416,7 +2406,6 @@ void loop() {
                 Serial.print(F(" B/s  retx=")); Serial.print(iRetx);
                 Serial.print(F(" (")); Serial.print(retxPct); Serial.print(F("%)"));
                 Serial.print(F("  drop="));    Serial.print(txDropped - testTxDropBase);
-                // KA: sent this second?
                 printKaStats();
                 testIBytes    = 0;
                 testIPkts     = 0;
