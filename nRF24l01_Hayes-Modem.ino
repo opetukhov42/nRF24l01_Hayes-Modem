@@ -136,7 +136,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.144.0"
+#define MODEM_VERSION "v1.146.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -753,19 +753,21 @@ static void buildTestPacket(uint8_t *buf, uint32_t counter) {
 void flushTxBuffer() {
     if (state != S_DATA && state != S_CONNECTED) return;
 
-    // Ping delivery, idle case only: send standalone ONLY when we haven't
-    // sent a SWACK recently — meaning no incoming data is arriving for us
-    // to piggyback on. If data IS flowing in (e.g. ATTEST-RX), swflowAckData
-    // will piggyback this ping on its next reply, which is always safer
-    // (remote's radio is guaranteed listening right after it transmitted).
-    // PONG/XON/XOFF never reach here — always queued in response to
-    // received data, where piggyback always applies. Only PING can be
-    // queued during genuine silence with nothing to piggyback on.
+    // Ping/pong delivery, standalone fallback: send directly whenever we
+    // have no recent outgoing SWACK to piggyback on. This covers two
+    // distinct cases:
+    //  - Genuine silence: neither side transmitting anything — PING needs
+    //    a standalone send to provoke any reply at all.
+    //  - Pure data SENDER (e.g. ATTEST-TX): swflowAckData() is only ever
+    //    called by the data RECEIVER side. A pure sender never SWACKs
+    //    anything, so it has no piggyback opportunity to reply with a
+    //    PONG when it receives a piggybacked PING — must send standalone.
     bool noRecentSwack = (millis() - lastSwackSentMs) > (unsigned long)SW_ACK_WAIT_MS * 4UL;
-    if (ctrlPktReady && ctrlPktType == PKT_PING && noRecentSwack) {
+    if (ctrlPktReady && noRecentSwack &&
+        (ctrlPktType == PKT_PING || ctrlPktType == PKT_PONG)) {
         ctrlPktReady = false;
-        sendDirectCtrl(PKT_PING);
-        kaLastPingSentMs = millis();
+        sendDirectCtrl(ctrlPktType);
+        if (ctrlPktType == PKT_PING) kaLastPingSentMs = millis();
         return;
     }
 
@@ -1044,6 +1046,20 @@ void handleRadioPacket(const uint8_t *pkt) {
             if (state == S_DATA || state == S_CONNECTED) {
                 kaLastPingRcvdMs = millis();
                 swflowAckData(pkt[1]);
+            }
+            break;
+
+        case PKT_PONG:
+            // Standalone pong — direct reply from a pure data SENDER that
+            // has no piggyback opportunity (never calls swflowAckData()
+            // itself). Confirms our ping exactly like a normal SWACK does.
+            if (state == S_DATA || state == S_CONNECTED) {
+                kaLastConfirmedMs = millis();
+                if (kaWaitingSwack) {
+                    kaWaitingSwack = false;
+                    kaMissed       = 0;
+                    kaPingAt       = millis() + (unsigned long)regS11 * 1000UL;
+                }
             }
             break;
 
