@@ -136,7 +136,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.143.0"
+#define MODEM_VERSION "v1.144.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -781,22 +781,22 @@ void flushTxBuffer() {
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
-                // Handle all packets immediately. PKT_PING triggers an
-                // immediate SWACK reply (handleRadioPacket → swflowAckData).
-                // PKT_PONG/XON/XOFF only ever travel piggybacked inside a
-                // SWACK payload now, never as a top-level type — no case
-                // needed for them here.
-                // No re-entrancy risk: handleRadioPacket never calls flushTxBuffer.
-                if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD ||
-                    pt == PKT_DATA  || pt == PKT_PING) {
+                // SWACK/YIELD handled immediately — they only update local
+                // state, never switch radio mode (no openWritePipe).
+                // PKT_DATA and PKT_PING are deferred to pendingPkt: their
+                // handlers call swflowAckData() which does openWritePipe→
+                // write→openListenPipes, switching us to TX mode. Doing
+                // that here, mid-wait, would risk missing whatever we're
+                // actually waiting for. Processed safely next loop() pass.
+                if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
+                    handleRadioPacket(tmp);
+                    gotPkt = true;
+                } else if (!pendingPktReady) {
                     if (pt == PKT_DATA) {
                         if (testRxActive)   testRxPkts++;
                         if (testEchoActive) { testEchoCount++; testEchoICount++; }
                         if (testTxRxActive) testTxRxRxPkts++;
                     }
-                    handleRadioPacket(tmp);
-                    gotPkt = true;
-                } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
                     gotPkt = true;
@@ -851,14 +851,15 @@ void flushTxBuffer() {
                 } else if (pt == PKT_SWACK || pt == PKT_SWACK_YIELD) {
                     // Stale SWACK — process but don't confirm
                     handleRadioPacket(tmp);
-                } else if (pt == PKT_DATA || pt == PKT_PING) {
+                } else if (!pendingPktReady) {
+                    // PKT_DATA and PKT_PING both trigger swflowAckData()
+                    // internally (radio mode switch) — defer to avoid
+                    // disrupting our own SWACK-receive window.
                     if (pt == PKT_DATA) {
                         if (testRxActive)   testRxPkts++;
                         if (testEchoActive) { testEchoCount++; testEchoICount++; }
                         if (testTxRxActive) testTxRxRxPkts++;
                     }
-                    handleRadioPacket(tmp);
-                } else if (!pendingPktReady) {
                     memcpy(pendingPkt, tmp, PAYLOAD_SIZE);
                     pendingPktReady = true;
                 }
