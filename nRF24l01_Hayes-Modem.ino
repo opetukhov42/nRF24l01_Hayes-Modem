@@ -136,7 +136,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.146.0"
+#define MODEM_VERSION "v1.147.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -290,7 +290,8 @@ char cmdBuf[CMD_BUF_SIZE];
 uint8_t cmdLen = 0;
 
 // XON/XOFF state
-bool hostXoffSent  = false;   // we told the host to stop
+bool hostXoffSent      = false;   // we told the host to stop (radio→serial direction full)
+bool txHostXoffSent    = false;   // we told the host to stop (serial→radio direction full)
 bool radioXoffRecv  = false;  // remote told us to stop
 bool radioXoffSent  = false;  // we told remote to stop
 bool    yieldToRemote  = false;  // remote sent SWACK_YIELD — pause our TX, let them send
@@ -874,29 +875,45 @@ void flushTxBuffer() {
 
 // ── XON/XOFF management ──────────────────────────────────────────────────────
 void checkFlowControl() {
-    uint16_t used = rxAvail();
+    uint16_t rxUsed = rxAvail();   // radio→serial buffer (toward host)
+    uint16_t txUsed = txAvail();   // serial→radio buffer (from host)
 
-    // Tell host to stop/resume — only if XON/XOFF mode is enabled (S13=1)
+    // Tell host to stop/resume — only if XON/XOFF mode is enabled (S13=1).
+    // Two independent reasons we might need the host to pause:
+    //  a) rxBuf filling — host isn't draining what we hand it fast enough
+    //  b) txBuf filling — host is sending faster than the radio can drain
+    // Either condition alone is enough to assert XOFF; both must clear
+    // before we assert XON, so the host doesn't get a premature resume
+    // while the other buffer is still backed up.
     if (regS13 == 1) {
-        if (!hostXoffSent && used >= XOFF_THRESHOLD) {
+        if (!hostXoffSent && rxUsed >= XOFF_THRESHOLD) {
             Serial.write(0x13);  // XOFF
             hostXoffSent = true;
         }
-        if (hostXoffSent && used <= XON_THRESHOLD) {
+        if (hostXoffSent && rxUsed <= XON_THRESHOLD && !txHostXoffSent) {
             Serial.write(0x11);  // XON
             hostXoffSent = false;
         }
+        if (!txHostXoffSent && txUsed >= XOFF_THRESHOLD) {
+            Serial.write(0x13);  // XOFF
+            txHostXoffSent = true;
+        }
+        if (txHostXoffSent && txUsed <= XON_THRESHOLD && !hostXoffSent) {
+            Serial.write(0x11);  // XON
+            txHostXoffSent = false;
+        }
     } else {
-        hostXoffSent = false;  // S13=0: never assert XOFF to host
+        hostXoffSent   = false;  // S13=0: never assert XOFF to host
+        txHostXoffSent = false;
     }
 
-    // Tell remote to stop — only when connected
+    // Tell remote to stop sending data to us — based on our rxBuf filling.
     if (state == S_DATA || state == S_CONNECTED) {
-        if (!radioXoffSent && used >= XOFF_THRESHOLD) {
+        if (!radioXoffSent && rxUsed >= XOFF_THRESHOLD) {
             queueCtrl(PKT_XOFF);
             radioXoffSent = true;
         }
-        if (radioXoffSent && used <= XON_THRESHOLD) {
+        if (radioXoffSent && rxUsed <= XON_THRESHOLD) {
             queueCtrl(PKT_XON);
             radioXoffSent = false;
         }
@@ -971,6 +988,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 radioXoffRecv  = false;
                 radioXoffSent  = false;
                 hostXoffSent   = false;
+                txHostXoffSent = false;
                 state = S_IDLE;
                 openListenPipes();
                 sendNoCarrier();
@@ -1722,6 +1740,7 @@ void processCommand(const char *cmd) {
         radioXoffRecv    = false;
         radioXoffSent    = false;
         hostXoffSent     = false;
+        txHostXoffSent   = false;
         // Clear SWFLOW window, buffers, and cancel any pending retry on hangup.
         clearBuffers();
         transBufLen = 0;
