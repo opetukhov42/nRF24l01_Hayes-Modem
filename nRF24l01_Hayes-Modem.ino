@@ -136,7 +136,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.147.0"
+#define MODEM_VERSION "v1.148.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -352,6 +352,7 @@ unsigned long autoDialMs = 0;  // millis() timestamp to fire autodial
 uint8_t swLastPkt[PAYLOAD_SIZE];  // last sent PKT_DATA for retransmit
 bool    swLastPktValid = false;   // true when swLastPkt holds a valid packet
 uint32_t swRetxCount   = 0;       // total retransmit attempts this session
+uint32_t swTxUnacked   = 0;       // bytes dropped after SW_RETX_MAX unacked
 
 // Radio health
 bool     radioFailed   = false;  // set on init fail or runtime disconnect
@@ -362,6 +363,7 @@ unsigned long lastHealthMs = 0;  // last time we ran isChipConnected()
 unsigned long lastDataMs = 0;    // millis() of last byte in data mode
 uint8_t  plusCount   = 0;        // count of consecutive '+' chars received
 bool     escapeArmed = false;    // true after first guard silence
+uint8_t  heldPlus    = 0;        // '+' chars withheld pending escape confirmation
 
 // SWFLOW duplicate detection
 uint8_t  rxLastSeq   = 0xFF;    // last accepted PKT_DATA seq (0xFF = none yet)
@@ -871,6 +873,15 @@ void flushTxBuffer() {
         }
         if (gotAck) break;
     }
+
+    // No SWACK after SW_RETX_MAX retransmits: this chunk is unconfirmed.
+    // It may have been delivered (only the ACK was lost) or truly dropped —
+    // either way we can't guarantee it, so record it instead of losing it
+    // silently. Surfaced by ATI.
+    if (!gotAck) {
+        swTxUnacked += n;
+        ledFlashER();
+    }
 }
 
 // ── XON/XOFF management ──────────────────────────────────────────────────────
@@ -989,6 +1000,9 @@ void handleRadioPacket(const uint8_t *pkt) {
                 radioXoffSent  = false;
                 hostXoffSent   = false;
                 txHostXoffSent = false;
+                heldPlus       = 0;
+                plusCount      = 0;
+                escapeArmed    = false;
                 state = S_IDLE;
                 openListenPipes();
                 sendNoCarrier();
@@ -1215,6 +1229,7 @@ void factoryReset() {
     regS18 = 0;
     txDropped = 0;
     rxDropped = 0;
+    swTxUnacked = 0;
 
     // Terminal
     echoOn = true;
@@ -1236,6 +1251,9 @@ void factoryReset() {
     yieldToRemote  = false;
     swLastPktValid = false;
     rxLastSeq      = 0xFF;
+    heldPlus       = 0;
+    plusCount      = 0;
+    escapeArmed    = false;
     clearBuffers();
 
     // Persist — saveConfig() writes magic byte last
@@ -1271,7 +1289,13 @@ void factoryReset() {
 // SPECTRUM_DWELL_MS replaced by S17 register (regS17) — see ATSn handler
 
 static void printSpectrumChHdr() {
-    printSpectrumChHdr();
+    // Tens-digit row, aligned under the same 5-space indent as the units ruler
+    // and the density output. For channel ch the character is the tens digit
+    // (ch/10)%10, so it reads 0000000000111111111122...  across all 126 columns.
+    Serial.print(F("     "));
+    for (uint8_t ch = 0; ch < 126; ch++)
+        Serial.write('0' + (ch / 10) % 10);
+    Serial.println();
 }
 
 static void printSpectrumRuler() {
@@ -1618,10 +1642,12 @@ void processCommand(const char *cmd) {
         i++;
     }
     uc[i] = '\0';
+    const uint8_t ucLen = i;   // length of uc — NOT the global cmdLen, which is
+                               // stale when processCommand() is called with a
+                               // synthesized string (ATRE, dial retry, autodial).
 
     // ── ATI ─────────────────────────────────────────────────────────────────
     if (strcmp(uc, "ATI") == 0) {
-        if (regS18) { sendOK(); return; }   // silent mode: suppress ATI output
         if (regS18) { sendOK(); return; }   // silent mode: suppress ATI output
         Serial.print(F("\r\nnRF24L01 AT Modem "));
         Serial.println(F(MODEM_VERSION));
@@ -1689,9 +1715,11 @@ void processCommand(const char *cmd) {
         Serial.print(F("S18     : ")); Serial.println(regS18 == 1 ? F("1 (silent mode ON)") : F("0 (normal output)"));
         Serial.print(F("TX drop : ")); Serial.print(txDropped); Serial.println(F(" bytes (TX overflow)"));
         Serial.print(F("RX drop : ")); Serial.print(rxDropped); Serial.println(F(" bytes (RX overflow)"));
+        Serial.print(F("TX unack: ")); Serial.print(swTxUnacked); Serial.println(F(" bytes (SWFLOW no-ACK)"));
         if (txDropped || rxDropped) Serial.println(F("** DATA LOSS: enable XON/XOFF (ATS13=1) **"));
         txDropped = 0;  // reset after display
         rxDropped = 0;
+        swTxUnacked = 0;
         if (regS10 && (state == S_DATA || state == S_CONNECTED)) {
             { unsigned long s = kaLastConfirmedMs ? (millis()-kaLastConfirmedMs)/1000UL : 9999;
               Serial.print(F("KA last : ")); Serial.print(s); Serial.println(F("s ago")); }
@@ -1746,6 +1774,9 @@ void processCommand(const char *cmd) {
         transBufLen = 0;
         dialRetrying   = false;
         dialRetryCount = 0;
+        heldPlus       = 0;
+        plusCount      = 0;
+        escapeArmed    = false;
         kaMissed          = 0;
         kaPingAt          = 0;
         kaLastPingSentMs  = 0;
@@ -1932,7 +1963,7 @@ void processCommand(const char *cmd) {
     // ── ATSn= / ATSn? — generic S-register handler ────────────────────────
     // Supported: S0 (auto-answer), S6 (pre-dial wait), S7 (carrier wait),
     //            S8 (retry count), S9 (retry interval seconds).
-    if (strncmp(uc, "ATS", 3) == 0 && cmdLen >= 4) {
+    if (strncmp(uc, "ATS", 3) == 0 && ucLen >= 4) {
         uint8_t reg = (uint8_t)atoi(uc + 3);
         // Find the '=' or '?' character after the register number.
         const char *p = uc + 3;
@@ -1942,24 +1973,28 @@ void processCommand(const char *cmd) {
 
         if (!isQuery && !isSet) { sendError(); return; }
 
-        // Map register number to its variable.
+        // Map register number to its variable, with a valid [min,max] range.
+        // Booleans accept only 0/1; the scan/flush/dwell registers reject 0
+        // (0 is treated as "invalid, use default" at boot, so forbid it here
+        // too — this also removes the ATS17=0 divide-by-zero in spectrumScan).
         uint8_t *regPtr = nullptr;
+        uint8_t  regMin = 0;
         uint8_t  regMax = 255;
         switch (reg) {
-            case 0: regPtr = &regS0; break;
-            case 6: regPtr = &regS6; break;
-            case 7: regPtr = &regS7; break;
-            case 8: regPtr = &regS8; break;
-            case 9:  regPtr = &regS9;  break;
-            case 10: regPtr = &regS10; break;
-            case 11: regPtr = &regS11; break;
-            case 12: regPtr = &regS12; break;
-            case 13: regPtr = &regS13; break;
-            case 14: regPtr = &regS14; break;
-            case 15: regPtr = &regS15; break;
-            case 16: regPtr = &regS16; break;
-            case 17: regPtr = &regS17; break;
-            case 18: regPtr = &regS18; break;
+            case 0:  regPtr = &regS0;               break;
+            case 6:  regPtr = &regS6;               break;
+            case 7:  regPtr = &regS7;  regMin = 1;  break;   // 0 = instant timeout
+            case 8:  regPtr = &regS8;               break;   // 255 = retry forever
+            case 9:  regPtr = &regS9;  regMin = 1;  break;   // 0 = dial storm
+            case 10: regPtr = &regS10; regMax = 1;  break;   // boolean
+            case 11: regPtr = &regS11; regMin = 1;  break;   // 0 = ping storm
+            case 12: regPtr = &regS12; regMin = 1;  break;   // 0 = drop on 1st miss
+            case 13: regPtr = &regS13; regMax = 1;  break;   // boolean
+            case 14: regPtr = &regS14; regMax = 1;  break;   // boolean
+            case 15: regPtr = &regS15; regMin = 1;  break;
+            case 16: regPtr = &regS16; regMin = 1;  break;
+            case 17: regPtr = &regS17; regMin = 1;  break;   // divisor in spectrumScan
+            case 18: regPtr = &regS18; regMax = 1;  break;   // boolean
             default: sendError(); return;
         }
 
@@ -1970,7 +2005,7 @@ void processCommand(const char *cmd) {
             sendOK();
         } else {
             int val = atoi(p + 1);
-            if (val >= 0 && val <= regMax) {
+            if (val >= (int)regMin && val <= (int)regMax) {
                 *regPtr = (uint8_t)val;
                 saveConfig();
                 sendOK();
@@ -1982,7 +2017,7 @@ void processCommand(const char *cmd) {
     }
 
     // ── AT&Zn=string / AT&Zn? ──────────────────────────────────────────────
-    if (strncmp(uc, "AT&Z", 4) == 0 && cmdLen >= 5) {
+    if (strncmp(uc, "AT&Z", 4) == 0 && ucLen >= 5) {
         uint8_t slot = (uint8_t)(uc[4] - '0');
         if (slot >= DIAL_SLOTS) { sendError(); return; }
         if (uc[5] == '?') {
@@ -2005,7 +2040,7 @@ void processCommand(const char *cmd) {
     }
 
     // ── AT&Yn / AT&Y? ───────────────────────────────────────────────────────
-    if (strncmp(uc, "AT&Y", 4) == 0 && cmdLen >= 5) {
+    if (strncmp(uc, "AT&Y", 4) == 0 && ucLen >= 5) {
         if (uc[4] == '?') {
             if (startupSlot < DIAL_SLOTS) {
                 Serial.print(startupSlot); Serial.print(F("\r\n"));
@@ -2130,6 +2165,20 @@ void processCommand(const char *cmd) {
 // Classic Hayes escape: 1 s silence, then +++, then 1 s silence.
 // We track the last time any data was sent to detect the pre-guard.
 
+// Push one outbound data byte into the correct buffer for the current mode
+// (raw transBuf in transparent mode, txBuf otherwise). Used for normal data
+// and for releasing withheld '+' chars when an escape attempt is aborted.
+void pushDataByte(uint8_t b) {
+    if (flowMode == 0) {
+        if (transBufLen < PAYLOAD_SIZE) {
+            transBuf[transBufLen++] = b;
+            transLastByteMs = millis();
+        }
+    } else {
+        txPush(b);
+    }
+}
+
 void checkEscape(uint8_t b) {
     // Only meaningful in DATA mode
     if (state != S_DATA) { plusCount = 0; return; }
@@ -2144,7 +2193,7 @@ void checkEscape(uint8_t b) {
                 plusCount = 1;
                 escapeArmed = true;
             }
-        } else if (escapeArmed) {
+        } else if (escapeArmed && plusCount != 255) {
             plusCount++;
             if (plusCount >= 3) {
                 // Post-guard: wait 1 s after third '+' handled in loop
@@ -2465,20 +2514,17 @@ void loop() {
             if (echoOn) Serial.write(b);
             checkEscape(b);
 
-            if (plusCount == 255) {
-                // Third '+' received — start post-guard timer; don't push to TX
-            } else if (!escapeArmed) {
-                if (flowMode == 0) {
-                    // Transparent mode: feed raw TX buffer directly
-                    if (transBufLen < PAYLOAD_SIZE) {
-                        transBuf[transBufLen++] = b;
-                        transLastByteMs = millis();
-                    }
-                    // If buffer full, flush immediately via flushTransparent()
-                    // called later in loop()
-                } else {
-                    txPush(b);
-                }
+            if (b == '+' && escapeArmed) {
+                // Part of a candidate +++ escape (valid pre-guard seen).
+                // Withhold it — released as data if the sequence aborts,
+                // discarded if the escape completes (see post-guard block).
+                if (heldPlus < 255) heldPlus++;
+            } else {
+                // Either a non-'+' (escape aborted) or a '+' with no valid
+                // pre-guard (literal data). Release any withheld '+' chars
+                // as data first, then the current byte.
+                while (heldPlus > 0) { pushDataByte('+'); heldPlus--; }
+                pushDataByte(b);
             }
         } else {
             // Command mode
@@ -2504,6 +2550,7 @@ void loop() {
         state = S_CONNECTED;
         plusCount = 0;
         escapeArmed = false;
+        heldPlus = 0;             // the withheld '+++' was the escape — discard
         kaResetWindow();
         Serial.print(F("\r\n"));
         sendOK();
@@ -2703,6 +2750,9 @@ void loop() {
                     kaLastPingRcvdMs  = 0;
                     kaWaitingSwack    = false;
                     kaLastConfirmedMs = 0;
+                    heldPlus          = 0;
+                    plusCount         = 0;
+                    escapeArmed       = false;
                     state = S_IDLE;
                     openListenPipes();
                     sendNoCarrier();
