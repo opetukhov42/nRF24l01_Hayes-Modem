@@ -14,6 +14,17 @@ Current firmware version: **v1.147.0**
 
 ---
 
+## Bi-Direction transfer test
+
+![Typical session](images/Dual TX-RX test.jpg)
+
+---
+
+## Idle link stability (KeepAlive) test
+
+![Typical session](images/Idel link stability test.jpg)
+
+---
 ## Features
 
 - **Full Hayes AT command set** — `ATD`, `ATA`, `ATO`, `ATH`, `ATI`, `ATE`, `ATRE`, `AT&F`, `AT&Z`, `AT&Y`
