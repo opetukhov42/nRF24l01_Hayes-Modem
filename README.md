@@ -413,30 +413,6 @@ KA miss : 0
 
 ---
 
-## Version History
-
-| Version | Summary |
-|---|---|
-| v1.0–v1.39 | Initial build through SWFLOW full rewrite to stop-and-wait |
-| v1.40–v1.55 | Baud rates, speed test, link quality metrics, payload B/s |
-| v1.56–v1.65 | Stop packet reliability, non-blocking tests, KA state fixes |
-| v1.66–v1.70 | PKT_DATA KA watchdog refresh, `kaResetWindow()` unified |
-| v1.71–v1.73 | RX packet counting, PKT_PING/PONG in ACK wait loop |
-| v1.74 | Uptime in ATI, ATRE, ATSETCHAUTO |
-| v1.75–v1.77 | Query `\r\n` framing, rxDropped double-count, production review |
-| v1.78–v1.79 | ATTEST-ECHO non-blocking, removed unreliable pong wait |
-| v1.80 | ACK wait drains all FIFO packets |
-| v1.81–v1.84 | KA stats in test output, answerer KA progression display |
-| v1.85–v1.87 | Pong via cooperative yield (`pendingPong`), XOFF bypass |
-| v1.88 | Pong sent 3× with 2 ms gaps for reliability |
-| v1.89 | Adaptive yield window: 50 ms for pong, 10 ms for data |
-| v1.90–v1.91 | XON/XOFF honoured in test TX fill loop and echo reflect |
-| v1.92–v1.93 | Speed overflow fix (long tests), echo one-packet-at-a-time |
-| v1.94–v1.95 | ATTEST-TXRX, MAC in test packet, buildTestPacket updated |
-| v1.96–v1.97 | TXRX stats fixes, all test flags cleared on start, `retxPct` fix |
-| v1.98 | `pendingPkt` path counts test RX packets — fixes TXRX rx asymmetry |
-
----
 
 ## License
 
