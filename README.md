@@ -16,13 +16,13 @@ Current firmware version: **v1.147.0**
 
 ## Bi-Direction transfer test
 
-![Typical session](images/Dual TX-RX test.jpg)
+![Typical session](images/Dual%20TX-RX%20test.jpg)
 
 ---
 
 ## Idle link stability (KeepAlive) test
 
-![Typical session](images/Idel link stability test.jpg)
+![Typical session](images/Idel%20link%20stability%20test.jpg)
 
 ---
 ## Features
