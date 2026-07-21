@@ -136,7 +136,7 @@
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.148.0"
+#define MODEM_VERSION "v1.149.0"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -273,6 +273,13 @@ bool     dialRetrying    = false;      // true while waiting between retries
 unsigned long dialRetryAt = 0;         // millis() when next retry fires
 char     lastDialStr[DIAL_STR_LEN + 5]; // "ATD XXYYZZ" copy for retransmission
 
+// Persistent-link intent. Set true when THIS node initiates a dial (ATD or
+// autodial); cleared only by an explicit ATH or a factory reset. It marks the
+// initiator so that, with retry-forever (S8=255), the dial loop is re-armed
+// after ANY involuntary disconnect. The receiver never issues ATD, so it never
+// sets this and therefore never auto-dials — roles stay fixed.
+bool     linkWanted = false;
+
 // Incoming call state (used while S_RINGING)
 uint8_t  pendingMac[3]  = {0, 0, 0};  // MAC of the caller waiting to be answered
 uint8_t  ringCount   = 0;   // how many RINGs sent (for S0 auto-answer threshold)
@@ -357,7 +364,9 @@ uint32_t swTxUnacked   = 0;       // bytes dropped after SW_RETX_MAX unacked
 // Radio health
 bool     radioFailed   = false;  // set on init fail or runtime disconnect
 unsigned long lastHealthMs = 0;  // last time we ran isChipConnected()
+unsigned long radioRetryAt = 0;  // millis() when the next radio.begin() retry is due
 #define HEALTH_INTERVAL_MS  500  // check every 500 ms
+#define RADIO_RETRY_MS     5000  // re-init a failed radio every 5 s (self-heal)
 
 // Escape sequence (+++) detection
 unsigned long lastDataMs = 0;    // millis() of last byte in data mode
@@ -1242,6 +1251,7 @@ void factoryReset() {
     // Runtime state — cancel anything in progress
     dialRetryCount = 0;
     dialRetrying   = false;
+    linkWanted     = false;
     autoDial       = false;
     lastConnMs     = 0;
     memset(lastDialStr, 0, sizeof(lastDialStr));
@@ -1772,6 +1782,9 @@ void processCommand(const char *cmd) {
         // Clear SWFLOW window, buffers, and cancel any pending retry on hangup.
         clearBuffers();
         transBufLen = 0;
+        // ATH is a deliberate local hangup — drop the persistent-link intent so
+        // the auto-reconnect logic does NOT redial. ATD is the way back up.
+        linkWanted     = false;
         dialRetrying   = false;
         dialRetryCount = 0;
         heldPlus       = 0;
@@ -1879,6 +1892,10 @@ void processCommand(const char *cmd) {
         if (parseMac(macStr, mac)) {
             memcpy(remoteMac, mac, 3);
             saveConfig();
+
+            // Mark that this node wants the link up. Enables persistent
+            // auto-reconnect (loop section 4b) whenever S8=255.
+            linkWanted = true;
 
             // Save full command for retry re-execution.
             strncpy(lastDialStr, cmd, sizeof(lastDialStr) - 1);
@@ -2212,29 +2229,54 @@ void checkEscape(uint8_t b) {
 // Called every HEALTH_INTERVAL_MS from loop(). Uses isChipConnected() which
 // reads the CONFIG register over SPI — returns false if the module is absent
 // or has lost power. On fault: drop any active connection, assert ER steady,
-// clear MR. Recovery requires a hardware reset (power-cycle the Arduino).
+// clear MR, then retry radio.begin() every RADIO_RETRY_MS (5 s) until the
+// module answers again — no hardware reset needed. Serial notices are emitted
+// on fault, on each retry, and on recovery (all honour S18 silent mode).
 void checkRadioHealth() {
     if (radioFailed) {
-        // Already failed — keep ER lit and MR dark, nothing else to do.
-        digitalWrite(LED_ER, HIGH);
+        // Hold fault LEDs and attempt re-initialisation every RADIO_RETRY_MS.
+        // Replaces the old "dead until hardware reset" behaviour: a transient
+        // supply glitch on the module (common in a vehicle, or when the remote
+        // end power-cycles a shared rail) now self-heals once power is back.
         digitalWrite(LED_MR, LOW);
+        digitalWrite(LED_ER, HIGH);
+        if (millis() < radioRetryAt) return;
+        radioRetryAt = millis() + RADIO_RETRY_MS;
+
+        if (!regS18) Serial.println(F("nRF24L01: re-init attempt..."));
+        if (radio.begin() && radio.isChipConnected()) {
+            // Recovered — restore configuration and resume listening.
+            radioFailed = false;
+            applyRadioConfig();
+            openListenPipes();
+            ledErOff = 0;
+            digitalWrite(LED_ER, LOW);
+            digitalWrite(LED_MR, HIGH);
+            if (!regS18) Serial.println(F("nRF24L01: recovered - radio OK"));
+            // If a persistent link was wanted, loop() section 4b re-arms the
+            // dial the moment radioFailed clears — no action needed here.
+        } else {
+            if (!regS18) Serial.println(F("nRF24L01: still not responding - retry in 5s"));
+        }
         return;
     }
 
     if (!radio.isChipConnected()) {
-        radioFailed = true;
-        cliPrintln(F("ERROR: nRF24L01 disconnected."));
+        radioFailed  = true;
+        radioRetryAt = millis() + RADIO_RETRY_MS;
 
-        // Drop any active connection gracefully (best-effort; radio may be gone)
+        // Drop any active connection first so the notice reaches the host — in
+        // data mode the serial stream is raw and CLI text is normally gated.
         if (state != S_IDLE) {
             state = S_IDLE;
-            sendNoCarrier();   // prints NO CARRIER and flashes ER (already failing)
+            sendNoCarrier();
         }
+        if (!regS18) Serial.println(F("ERROR: nRF24L01 disconnected - retrying every 5s"));
 
         // Assert fault LEDs immediately — updateSteadyLEDs will maintain them.
         digitalWrite(LED_MR, LOW);
         digitalWrite(LED_ER, HIGH);
-        ledErOff = 0;   // cancel any pending timer — ER stays on permanently
+        ledErOff = 0;
     }
 }
 
@@ -2265,22 +2307,21 @@ void setup() {
     loadConfig();   // read baudIdx before opening serial
     Serial.begin(baudTable[baudIdx]);
 
-    if (!radio.begin()) {
-        Serial.println(F("nRF24L01 not found. Check wiring."));
-        radioFailed = true;
+    if (!radio.begin() || !radio.isChipConnected()) {
+        // Don't hang forever waiting for the module. Mark it failed and let
+        // checkRadioHealth() retry begin() every RADIO_RETRY_MS. The modem
+        // stays responsive on serial and self-heals the moment the radio
+        // answers — important for an unattended always-on initiator.
+        radioFailed  = true;
+        radioRetryAt = millis() + RADIO_RETRY_MS;
         digitalWrite(LED_MR, LOW);
-        // Blink ER forever — stays in this loop so the user can see the fault
-        // even without a serial terminal attached.
-        while (true) {
-            digitalWrite(LED_ER, HIGH);
-            delay(200);
-            digitalWrite(LED_ER, LOW);
-            delay(200);
-        }
+        digitalWrite(LED_ER, HIGH);
+        if (!regS18)
+            Serial.println(F("nRF24L01 not found - retrying every 5s. Check wiring."));
+    } else {
+        applyRadioConfig();
+        openListenPipes();
     }
-
-    applyRadioConfig();
-    openListenPipes();
 
     if (!regS18) {
         Serial.print(F("\r\nnRF24L01 AT Modem "));
@@ -2598,6 +2639,34 @@ void loop() {
         if (regS8 == 255) cliPrintln(F("/forever)..."));
         else { cliPrint(F("/")); cliPrint(regS8); cliPrintln(F(")...")); }
         processCommand(lastDialStr);
+    }
+
+    // ── 4b. Persistent auto-reconnect ────────────────────────────────────────
+    // With retry-forever (S8=255), "retry" means the LINK, not just the first
+    // dial. Every involuntary disconnect — keep-alive timeout (section 10),
+    // remote PKT_DISC (handleRadioPacket), or a radio fault that has since
+    // recovered — lands us in S_IDLE WITHOUT re-arming the dialer. The normal
+    // S7-timeout retry loop only runs while dialling an unanswered call, so
+    // once an established link dropped, nothing dialled again. This block
+    // closes that gap: whenever we are idle, not already retrying, and we still
+    // want the link (linkWanted, set by ATD/autodial and cleared only by ATH),
+    // re-arm a fresh dial episode. Guards:
+    //   regS8 == 255   only in true retry-forever mode (finite S8 keeps its
+    //                  bounded per-dial meaning and is untouched here)
+    //   linkWanted     only the initiator; the receiver never sets it, so it
+    //                  stays idle and the home/car roles remain fixed
+    //   !radioFailed   don't spin the dialer on a dead radio; resumes on its
+    //                  recovery (checkRadioHealth clears radioFailed)
+    // Fires once per drop: it sets dialRetrying, after which the S7/S8/S9 loop
+    // takes over and the guard (!dialRetrying) keeps this quiet until the next
+    // established-then-dropped event.
+    if (regS8 == 255 && linkWanted && !radioFailed
+        && state == S_IDLE && !dialRetrying && lastDialStr[0] != '\0') {
+        dialRetryCount = 0;
+        dialRetrying   = true;
+        dialRetryAt    = now + (unsigned long)regS9 * 1000UL;
+        cliPrintln(F("LINK LOST - reconnecting"));
+        ledFlashER();
     }
 
     // ── 5. Receive radio packets ─────────────────────────────────────────────
