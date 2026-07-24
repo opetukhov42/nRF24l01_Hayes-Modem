@@ -131,12 +131,12 @@
 
 #include <SPI.h>
 #include <RF24.h>
-#include <avr/wdt.h>    // watchdog — used by ATREBOOT
+#include <avr/wdt.h>    // watchdog — kept for compatibility if needed, though reboot uses asm now
 #include <EEPROM.h>
 
 // ── Firmware version ───────────────────────────────────────────────────────────
 // Increment minor version (v1.x.0) on every code modification.
-#define MODEM_VERSION "v1.149.0"
+#define MODEM_VERSION "v1.149.1-fixed"
 
 // ── Pin config ────────────────────────────────────────────────────────────────
 #define CE_PIN   7    // RF-Nano: nRF24L01 CE  hardwired to D7
@@ -258,7 +258,7 @@ uint32_t rxDropped   = 0;    // bytes dropped: radio→serial direction (radio c
 // Any received packet updates kaLastConfirmedMs (link proof). Ping sent
 // only during silence; SWACK = confirmed; no pong needed.
 unsigned long kaLastConfirmedMs = 0; // millis() of last received packet
-unsigned long kaPingAt          = 0; // millis() when next probe is due
+unsigned long kaWindowStart     = 0; // millis() when current KA window started
 unsigned long kaLastPingSentMs  = 0; // millis() when last PKT_PING was queued
 unsigned long kaLastPingRcvdMs  = 0; // millis() when last PKT_PING was received
 bool          kaWaitingSwack    = false; // true after ping queued, until SWACK received
@@ -270,7 +270,7 @@ unsigned long lastSwackSentMs = 0;    // millis() of last SWACK we sent (any rea
 // Dial retry state (managed by the connect-timeout block in loop())
 uint32_t dialRetryCount  = 0;          // retries fired so far (uint32 for forever mode)
 bool     dialRetrying    = false;      // true while waiting between retries
-unsigned long dialRetryAt = 0;         // millis() when next retry fires
+unsigned long dialRetryStart = 0;      // millis() when dial wait started
 char     lastDialStr[DIAL_STR_LEN + 5]; // "ATD XXYYZZ" copy for retransmission
 
 // Persistent-link intent. Set true when THIS node initiates a dial (ATD or
@@ -312,9 +312,9 @@ uint8_t pendingPkt[PAYLOAD_SIZE];
 // SD and RD are monostable: they light for LED_FLASH_MS then go dark.
 // ER lights for LED_ER_MS on errors.
 // MR, TR, OH, CD, HS are steady-state and updated by updateSteadyLEDs().
-unsigned long ledSdOff  = 0;   // millis() time to extinguish SD
-unsigned long ledRdOff  = 0;   // millis() time to extinguish RD
-unsigned long ledErOff  = 0;   // millis() time to extinguish ER
+unsigned long ledSdStart  = 0;   // millis() time when SD flash started
+unsigned long ledRdStart  = 0;   // millis() time when RD flash started
+unsigned long ledErStart  = 0;   // millis() time when ER flash started
 
 // TR blinks while there is pending TX data; track last serial activity
 unsigned long lastSerialMs = 0;
@@ -346,7 +346,7 @@ uint8_t        baudIdx         = BAUD_DEFAULT;
 char    dialStr[DIAL_SLOTS][DIAL_STR_LEN + 1];  // "" = empty slot
 uint8_t startupSlot = 0xFF;                      // 0xFF = autodial disabled
 bool    autoDial    = false;   // armed in setup() if startup slot is valid + non-empty
-unsigned long autoDialMs = 0;  // millis() timestamp to fire autodial
+unsigned long autoDialStart = 0;  // millis() timestamp when autodial timer started
 
 // ── SWFLOW simple stop-and-wait ───────────────────────────────────────────────
 // Sends one PKT_DATA, waits SW_ACK_WAIT_MS for a SWACK, retries up to
@@ -364,7 +364,7 @@ uint32_t swTxUnacked   = 0;       // bytes dropped after SW_RETX_MAX unacked
 // Radio health
 bool     radioFailed   = false;  // set on init fail or runtime disconnect
 unsigned long lastHealthMs = 0;  // last time we ran isChipConnected()
-unsigned long radioRetryAt = 0;  // millis() when the next radio.begin() retry is due
+unsigned long radioFailTime = 0; // millis() when radio failed
 #define HEALTH_INTERVAL_MS  500  // check every 500 ms
 #define RADIO_RETRY_MS     5000  // re-init a failed radio every 5 s (self-heal)
 
@@ -410,6 +410,11 @@ uint32_t testPktCounter = 0;    // incrementing counter for buildTestPacket
 unsigned long testStart     = 0;
 unsigned long testLastStats = 0;
 
+// ── Method Declarations ───────────────────────────────────────────────────────
+void handleRadioPacket(const uint8_t *pkt);
+bool swflowAckData(uint8_t seq);
+void doAnswer();
+void sendConnectAck();
 
 // ── LED helpers ───────────────────────────────────────────────────────────────
 
@@ -426,19 +431,22 @@ void ledSetup() {
 // Trigger the SD (Send Data) flash.
 void ledFlashSD() {
     digitalWrite(LED_SD, HIGH);
-    ledSdOff = millis() + LED_FLASH_MS;
+    ledSdStart = millis();
+    if (ledSdStart == 0) ledSdStart = 1;
 }
 
 // Trigger the RD (Receive Data) flash.
 void ledFlashRD() {
     digitalWrite(LED_RD, HIGH);
-    ledRdOff = millis() + LED_FLASH_MS;
+    ledRdStart = millis();
+    if (ledRdStart == 0) ledRdStart = 1;
 }
 
 // Trigger the ER (Error) flash — longer pulse so it's visible.
 void ledFlashER() {
     digitalWrite(LED_ER, HIGH);
-    ledErOff = millis() + LED_ER_MS;
+    ledErStart = millis();
+    if (ledErStart == 0) ledErStart = 1;
 }
 
 // Update all steady-state LEDs to reflect current modem state.
@@ -464,10 +472,10 @@ void updateSteadyLEDs() {
 // Expire monostable LEDs whose timer has elapsed.
 void updateFlashLEDs() {
     unsigned long now = millis();
-    if (ledSdOff && now >= ledSdOff) { digitalWrite(LED_SD, LOW); ledSdOff = 0; }
-    if (ledRdOff && now >= ledRdOff) { digitalWrite(LED_RD, LOW); ledRdOff = 0; }
-    if (ledErOff && now >= ledErOff) {
-        ledErOff = 0;
+    if (ledSdStart && now - ledSdStart >= LED_FLASH_MS) { digitalWrite(LED_SD, LOW); ledSdStart = 0; }
+    if (ledRdStart && now - ledRdStart >= LED_FLASH_MS) { digitalWrite(LED_RD, LOW); ledRdStart = 0; }
+    if (ledErStart && now - ledErStart >= LED_ER_MS) {
+        ledErStart = 0;
         // Keep ER lit steady if radio has failed permanently.
         if (!radioFailed) digitalWrite(LED_ER, LOW);
     }
@@ -788,10 +796,12 @@ void flushTxBuffer() {
     if (yieldToRemote) {
         yieldToRemote = false;
         unsigned long yieldMs = (unsigned long)SW_ACK_WAIT_MS * 2;
-        unsigned long yieldEnd = millis() + yieldMs;
+        unsigned long startMs = millis();
         bool gotPkt = false;
-        while (millis() < yieldEnd) {
-            while (radio.available()) {
+        while (millis() - startMs < yieldMs) {
+            uint8_t pktLimit = 10; // Protect against radio flood
+            while (radio.available() && pktLimit > 0) {
+                pktLimit--;
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
@@ -851,9 +861,11 @@ void flushTxBuffer() {
             openListenPipes();
         } else break;
 
-        unsigned long waitEnd = millis() + SW_ACK_WAIT_MS;
-        while (millis() < waitEnd) {
-            while (radio.available()) {
+        unsigned long startMs = millis();
+        while (millis() - startMs < SW_ACK_WAIT_MS) {
+            uint8_t pktLimit = 10; // Protect against radio flood
+            while (radio.available() && pktLimit > 0) {
+                pktLimit--;
                 uint8_t tmp[PAYLOAD_SIZE];
                 radio.read(tmp, PAYLOAD_SIZE);
                 uint8_t pt = tmp[0];
@@ -885,7 +897,7 @@ void flushTxBuffer() {
 
     // No SWACK after SW_RETX_MAX retransmits: this chunk is unconfirmed.
     // It may have been delivered (only the ACK was lost) or truly dropped —
-    // either way we can't guarantee it, so record it instead of losing it
+    // either way we can guarantee it, so record it instead of losing it
     // silently. Surfaced by ATI.
     if (!gotAck) {
         swTxUnacked += n;
@@ -993,10 +1005,10 @@ void handleRadioPacket(const uint8_t *pkt) {
         case PKT_DISC:
             if (state == S_DATA || state == S_CONNECTED) {
                 lastDisconnectMs = millis();
-    connectedAt      = 0;
+                connectedAt      = 0;
                 clearBuffers();
                 kaMissed          = 0;
-                kaPingAt          = 0;
+                kaWindowStart     = 0;
                 kaLastPingSentMs  = 0;
                 kaLastPingRcvdMs  = 0;
                 kaWaitingSwack    = false;
@@ -1035,7 +1047,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 swRetxCount    = 0;
                 kaMissed          = 0;
                 kaLastConfirmedMs = millis();
-                kaPingAt          = millis() + (unsigned long)regS11 * 1000UL;
+                kaWindowStart     = millis();
                 connectedAt   = millis();
                 sendConnect();           // print while still in CLI mode
                 state         = S_DATA;  // switch AFTER printing CONNECT
@@ -1099,7 +1111,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                 if (kaWaitingSwack) {
                     kaWaitingSwack = false;
                     kaMissed       = 0;
-                    kaPingAt       = millis() + (unsigned long)regS11 * 1000UL;
+                    kaWindowStart  = millis();
                 }
             }
             break;
@@ -1116,7 +1128,7 @@ void handleRadioPacket(const uint8_t *pkt) {
                     // Ping was confirmed — clear miss counter, reset full window
                     kaWaitingSwack = false;
                     kaMissed       = 0;
-                    kaPingAt       = millis() + (unsigned long)regS11 * 1000UL;
+                    kaWindowStart  = millis();
                 }
             }
             swLastPktValid = false;
@@ -1177,7 +1189,7 @@ bool swflowAckData(uint8_t seq) {
 // a clean full window regardless of time spent in the previous state.
 void kaResetWindow() {
     kaLastConfirmedMs = millis();
-    kaPingAt          = millis() + (unsigned long)regS11 * 1000UL;
+    kaWindowStart     = millis();
     kaMissed          = 0;
 }
 
@@ -1198,7 +1210,7 @@ void doAnswer() {
     sendConnectAck();
     kaMissed          = 0;
     kaLastConfirmedMs = millis();
-    kaPingAt          = millis() + (unsigned long)regS11 * 1000UL;
+    kaWindowStart     = millis();
     connectedAt       = millis();
     sendConnect();           // print while still in CLI mode
     state         = S_DATA;  // switch to data mode AFTER printing CONNECT
@@ -1256,7 +1268,7 @@ void factoryReset() {
     lastConnMs     = 0;
     memset(lastDialStr, 0, sizeof(lastDialStr));
     kaMissed          = 0;
-    kaPingAt          = 0;
+    kaWindowStart     = 0;
     kaLastConfirmedMs = 0;
     yieldToRemote  = false;
     swLastPktValid = false;
@@ -1522,8 +1534,8 @@ void atPing(const uint8_t targetMac[3]) {
     }
 
     // Wait up to S7 seconds for PKT_DIAG_PONG
-    unsigned long deadline = millis() + (unsigned long)regS7 * 1000UL;
-    while (millis() < deadline) {
+    unsigned long startMs = millis();
+    while (millis() - startMs < (unsigned long)regS7 * 1000UL) {
         if (radio.available()) {
             uint8_t pkt[PAYLOAD_SIZE];
             radio.read(pkt, PAYLOAD_SIZE);
@@ -1614,6 +1626,9 @@ void speedTestTxRx() {
 
 // ── Command parser ────────────────────────────────────────────────────────────
 bool parseMac(const char *str, uint8_t mac[3]) {
+    // Защита от переполнения/чтения за пределами строки
+    if (strlen(str) < 6) return false;
+    
     // Expects exactly 6 hex digits, e.g. "A1B2C3"
     char tmp[7];
     strncpy(tmp, str, 6);
@@ -1791,7 +1806,7 @@ void processCommand(const char *cmd) {
         plusCount      = 0;
         escapeArmed    = false;
         kaMissed          = 0;
-        kaPingAt          = 0;
+        kaWindowStart     = 0;
         kaLastPingSentMs  = 0;
         kaLastPingRcvdMs  = 0;
         kaWaitingSwack    = false;
@@ -1913,8 +1928,8 @@ void processCommand(const char *cmd) {
 
             // S6: pre-dial wait — non-blocking so serial/LEDs stay responsive.
             if (regS6 > 0) {
-                unsigned long waitEnd = millis() + (unsigned long)regS6 * 1000UL;
-                while (millis() < waitEnd) {
+                unsigned long startMs = millis();
+                while (millis() - startMs < (unsigned long)regS6 * 1000UL) {
                     updateSteadyLEDs();
                     updateFlashLEDs();
                     lastSerialMs = millis(); // suppress TR flicker
@@ -2168,8 +2183,9 @@ void processCommand(const char *cmd) {
         sendOK();
         Serial.flush();
         delay(100);
-        wdt_enable(WDTO_15MS);
-        while (true) {}
+        // hardware reboot via watchdog (boots fresh from EEPROM)
+        // [FIXED] Используем jmp 0, чтобы избежать проблем с Watchdog на старых загрузчиках Nano
+        asm volatile ("jmp 0");
     }
 
     // ── AT (bare) ───────────────────────────────────────────────────────────
@@ -2240,8 +2256,8 @@ void checkRadioHealth() {
         // end power-cycles a shared rail) now self-heals once power is back.
         digitalWrite(LED_MR, LOW);
         digitalWrite(LED_ER, HIGH);
-        if (millis() < radioRetryAt) return;
-        radioRetryAt = millis() + RADIO_RETRY_MS;
+        if (millis() - radioFailTime < RADIO_RETRY_MS) return;
+        radioFailTime = millis();
 
         if (!regS18) Serial.println(F("nRF24L01: re-init attempt..."));
         if (radio.begin() && radio.isChipConnected()) {
@@ -2249,7 +2265,7 @@ void checkRadioHealth() {
             radioFailed = false;
             applyRadioConfig();
             openListenPipes();
-            ledErOff = 0;
+            ledErStart = 0;
             digitalWrite(LED_ER, LOW);
             digitalWrite(LED_MR, HIGH);
             if (!regS18) Serial.println(F("nRF24L01: recovered - radio OK"));
@@ -2263,7 +2279,7 @@ void checkRadioHealth() {
 
     if (!radio.isChipConnected()) {
         radioFailed  = true;
-        radioRetryAt = millis() + RADIO_RETRY_MS;
+        radioFailTime = millis();
 
         // Drop any active connection first so the notice reaches the host — in
         // data mode the serial stream is raw and CLI text is normally gated.
@@ -2276,7 +2292,7 @@ void checkRadioHealth() {
         // Assert fault LEDs immediately — updateSteadyLEDs will maintain them.
         digitalWrite(LED_MR, LOW);
         digitalWrite(LED_ER, HIGH);
-        ledErOff = 0;
+        ledErStart = 0;
     }
 }
 
@@ -2313,7 +2329,7 @@ void setup() {
         // stays responsive on serial and self-heals the moment the radio
         // answers — important for an unattended always-on initiator.
         radioFailed  = true;
-        radioRetryAt = millis() + RADIO_RETRY_MS;
+        radioFailTime = millis();
         digitalWrite(LED_MR, LOW);
         digitalWrite(LED_ER, HIGH);
         if (!regS18)
@@ -2332,7 +2348,7 @@ void setup() {
 
     if (startupSlot < DIAL_SLOTS && dialStr[startupSlot][0] != '\0') {
         autoDial   = true;
-        autoDialMs = millis() + 2000;
+        autoDialStart = millis();
         Serial.print(F("\r\nAutodial: slot "));
         Serial.print(startupSlot);
         Serial.print(F(" -> "));
@@ -2380,7 +2396,7 @@ void loop() {
     unsigned long now = millis();
 
     // ── 1. Autodial on startup ──────────────────────────────────────────────
-    if (autoDial && now >= autoDialMs) {
+    if (autoDial && now - autoDialStart >= 2000) {
         autoDial = false;
         if (state == S_IDLE) {
             char fakeCmd[DIAL_STR_LEN + 5];
@@ -2612,7 +2628,7 @@ void loop() {
                 && lastDialStr[0] != '\0') {
                 dialRetryCount++;
                 dialRetrying = true;
-                dialRetryAt  = now + (unsigned long)regS9 * 1000UL;
+                dialRetryStart = now;
                 cliPrint(F("NO CARRIER - retry "));
                 cliPrint(dialRetryCount);
                 if (retryForever) cliPrintln(F("/forever"));
@@ -2632,7 +2648,7 @@ void loop() {
     }
 
     // Fire a pending retry when S9 interval expires.
-    if (dialRetrying && now >= dialRetryAt) {
+    if (dialRetrying && now - dialRetryStart >= (unsigned long)regS9 * 1000UL) {
         dialRetrying = false;
         cliPrint(F("Redialling (attempt "));
         cliPrint(dialRetryCount);
@@ -2664,7 +2680,7 @@ void loop() {
         && state == S_IDLE && !dialRetrying && lastDialStr[0] != '\0') {
         dialRetryCount = 0;
         dialRetrying   = true;
-        dialRetryAt    = now + (unsigned long)regS9 * 1000UL;
+        dialRetryStart = now;
         cliPrintln(F("LINK LOST - reconnecting"));
         ledFlashER();
     }
@@ -2687,7 +2703,11 @@ void loop() {
             handleRadioPacket(pendingPkt);
         }
     }
-    if (radio.available()) {
+    
+    // Protect against radio flood while receiving data in the main loop
+    uint8_t loopPktLimit = 20;
+    while (radio.available() && loopPktLimit > 0) {
+        loopPktLimit--;
         uint8_t pkt[PAYLOAD_SIZE];
         radio.read(pkt, PAYLOAD_SIZE);
         if (testRxActive   && pkt[0] == PKT_DATA) testRxPkts++;
@@ -2799,9 +2819,10 @@ void loop() {
 
     // ── 10. Keep-alive tick — symmetric, same logic on both sides ────────────
     if (regS10 && (state == S_DATA || state == S_CONNECTED)) {
-        if (kaPingAt == 0)
-            kaPingAt = now + (unsigned long)regS11 * 1000UL;
-        if (now >= kaPingAt) {
+        if (kaWindowStart == 0)
+            kaWindowStart = now;
+        if (now - kaWindowStart >= (unsigned long)regS11 * 1000UL) {
+            kaWindowStart = now; // Restart window
             unsigned long kaNow     = millis();
             unsigned long silenceMs = kaLastConfirmedMs ? kaNow - kaLastConfirmedMs : kaNow;
             if (kaWaitingSwack) {
@@ -2814,7 +2835,7 @@ void loop() {
                 if (kaMissed >= regS12) {
                     lastDisconnectMs = millis();
                     clearBuffers();
-                    kaMissed = 0; kaPingAt = 0;
+                    kaMissed = 0; kaWindowStart = 0;
                     kaLastPingSentMs  = 0;
                     kaLastPingRcvdMs  = 0;
                     kaWaitingSwack    = false;
@@ -2830,18 +2851,18 @@ void loop() {
                     queueCtrl(PKT_PING);
                     kaLastPingSentMs = millis();
                     kaWaitingSwack   = true;
-                    kaPingAt = kaNow + (unsigned long)regS11 * 1000UL;
+                    kaWindowStart    = kaNow;
                 }
             } else if (silenceMs >= (unsigned long)regS11 * 1000UL) {
                 // Silent for a full window — send probe
                 queueCtrl(PKT_PING);
                 kaLastPingSentMs = millis();
                 kaWaitingSwack   = true;
-                kaPingAt = kaNow + (unsigned long)regS11 * 1000UL;
+                kaWindowStart    = kaNow;
             } else {
                 // Recent SWACK confirmed — link alive, reset window
                 kaMissed = 0;
-                kaPingAt = kaNow + (unsigned long)regS11 * 1000UL;
+                kaWindowStart = kaNow;
             }
         }
     }
