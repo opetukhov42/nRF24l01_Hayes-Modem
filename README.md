@@ -4,7 +4,7 @@ A full Hayes-compatible AT command modem emulator for Arduino, using the nRF24L0
 
 Designed and tested on the **RF-Nano** (Arduino Nano with onboard nRF24L01+), and compatible with any Arduino Uno / Nano with an external nRF24L01+ module.
 
-Current firmware version: **v1.147.0**
+Current firmware version: **v1.149.1-fixed**
 
 ---
 
