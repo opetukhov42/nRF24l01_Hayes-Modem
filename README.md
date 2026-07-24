@@ -2,7 +2,7 @@
 
 A full Hayes-compatible AT command modem emulator for Arduino, using the nRF24L01+ radio module as the wireless link. Connect two Arduinos and get a wireless serial pipe with proper modem semantics: dialling, answering, flow control, keep-alive, diagnostics, and status LEDs — or configure both as a completely silent, invisible wireless bridge.
 
-Designed and tested on the **RF-Nano** (Arduino Nano with onboard nRF24L01+), and compatible with any Arduino Uno / Nano with an external nRF24L01+ module.
+Designed and tested on the **RF-Nano** (Arduino Nano with onboard nRF24L01+), and compatible with any Arduino Uno / Nano with an external nRF24L01+ module (also tested on Nano + external nRF24l01-PA-LNA module).
 
 Current firmware version: **v1.149.1-fixed**
 
